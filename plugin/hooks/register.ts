@@ -30,8 +30,9 @@ function plain(m: SessionMessage): Built {
   }
 }
 
+/** The CLI ships inside the plugin as one bundled file, so an installed copy needs only node. */
 function cli($: EngineInterface): string[] {
-  return ['node', `${$.plugin.root}/../dist/cli.js`]
+  return ['node', `${$.plugin.root}/bin/strata.mjs`]
 }
 
 /**

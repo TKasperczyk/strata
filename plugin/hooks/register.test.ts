@@ -44,7 +44,7 @@ describe('strataCompact', () => {
     const result = await strataCompact(fakeEngine(cli(stdout), calls, logs), { trigger: 'manual', messages: MESSAGES }, builtIn, SESSION)
     expect(result.messages?.map(m => m.text)).toEqual([HEADER.text, 'old answer', 'latest prompt'])
     expect(result.messages?.[1]?.handle).toBe('h1')
-    expect(calls[0]?.argv).toEqual(['node', '/plugins/strata/plugin/../dist/cli.js', 'compact', '--session', SESSION, '--in', '-', '--out', '-'])
+    expect(calls[0]?.argv).toEqual(['node', '/plugins/strata/plugin/bin/strata.mjs', 'compact', '--session', SESSION, '--in', '-', '--out', '-'])
     expect(JSON.parse(calls[0]?.stdin ?? '{}').messages).toHaveLength(3)
     expect(logs[0]).toContain('strata:')
   })

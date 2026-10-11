@@ -1,0 +1,19 @@
+{
+  "name": "strata",
+  "owner": {
+    "name": "Tomasz Kasperczyk"
+  },
+  "description": "strata: layered, budget-bounded compaction for Claude Code, with a self-trigger and a background-prepared ledger",
+  "plugins": [
+    {
+      "name": "strata",
+      "source": "./plugin",
+      "description": "Answers compactions with strata's archive-backed, budget-bounded layered context, and prepares the ledger in the background"
+    },
+    {
+      "name": "strata-trigger",
+      "source": "./plugin-trigger",
+      "description": "Starts a strata compaction between turns once the context passes STRATA_TRIGGER_TOKENS"
+    }
+  ]
+}
