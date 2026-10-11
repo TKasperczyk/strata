@@ -2,7 +2,7 @@
 
 Layered, budget-bounded compaction for Claude Code. It replaces the built-in "summarize everything" compaction with:
 
-1. **A text archive.** The text of every message the session produced goes into `~/.strata/sessions/<session-id>/archive.jsonl`: prompts, replies, tool calls and full tool results. Images, documents and thinking blocks are not archived. They survive only while their message stays in the verbatim tail, and a placeholder marks where one was.
+1. **An archive.** The text of every message the session produced goes into `~/.strata/sessions/<session-id>/archive.jsonl`: prompts, replies, tool calls and full tool results. Images (screenshots read by a tool, pasted pictures) are saved as files under `media/`, and a rebuilt message points at its file so the model can open it with Read. Documents and thinking blocks are not archived; thinking only survives while its message stays in the verbatim tail.
 2. **Rebuilt from the active branch every time.** Each compaction rebuilds the live context from the archive under a fixed, enforced token budget. It never summarizes a previous summary, so the size stays flat however many compactions run. A rewind drops the abandoned branch from the live context; the archive keeps it.
 
 Everything is laid out in whole units: a prompt, or a tool exchange, meaning an assistant response with every call and result it opened. The engine hands over one row per content block, with results interleaved between a response's calls. A unit is therefore never split, and a rebuilt exchange becomes one assistant turn plus one results turn, keeping every call paired with its result. The latest response always stays verbatim, from its opening thinking row on, because a rebuilt message loses its thinking block, and with manual extended thinking the final assistant turn must keep its own. strata declines instead, so the CLI exits 3 and the plugin falls back to the built-in compactor, in two cases: that response alone exceeds the budget, or part of it was already rebuilt by an earlier compaction, so its thinking can no longer be kept (this only happens after a rewind). A rejected compaction writes nothing, so a retry never archives anything twice.
@@ -35,6 +35,16 @@ Answer `y` to add the marketplace, then pick the user scope. Both plugins are th
 From a shell, the same is `claude plugin marketplace add TKasperczyk/strata`, then `claude plugin install strata@strata` and `claude plugin install strata-trigger@strata`. Update later with `claude plugin marketplace update strata` followed by `claude plugin update strata@strata` and `claude plugin update strata-trigger@strata`.
 
 Tune it with environment variables (see Settings below), e.g. in the `env` block of `~/.claude/settings.json`.
+
+## Counting what the rows hide
+
+The rows a compaction hook receives are text only, but a real session is mostly invisible weight. On one measured session, text was 233k tokens, while 92 screenshots added about 178k and 339 thinking blocks about 298k, for 784k in total. strata therefore also reads the same conversation in Messages API form (`$.session.messages({ as: 'api' })`), along with the engine's real token figures:
+
+- **Images** are priced from their pixel dimensions (width × height / 750). Tool-result images are matched to their row by tool_use_id, and pasted images to their prompt.
+- **Thinking** blocks are encrypted, so their size is estimated from signature length. The ratio varied from 2.8 to 5 characters per token between sessions, so it is calibrated on every compaction: the real window, minus the system prompt and tools, minus what strata can see, is the thinking.
+- Rows kept verbatim carry that weight, so the budget counts it. Rebuilt rows carry none: thinking is dropped and images become file pointers.
+
+Without the API form (an older engine, or an error reading it) strata falls back to budgeting text alone.
 
 ## Self-trigger and background ledger
 
@@ -74,7 +84,7 @@ claude --plugin-dir ./plugin --plugin-dir ./plugin-trigger
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `STRATA_BUDGET_TOKENS` | `100000` | Size of the rebuilt context (chars / 3.5 estimate). Set Claude Code's trigger well above it, e.g. `CLAUDE_CODE_AUTO_COMPACT_WINDOW`. |
+| `STRATA_BUDGET_TOKENS` | `100000` | Size of the rebuilt messages, in tokens: text (chars / 3.5) plus the images and thinking of the rows kept verbatim. Set Claude Code's trigger well above it, e.g. `CLAUDE_CODE_AUTO_COMPACT_WINDOW`. |
 | `STRATA_LEDGER_MODEL` | `claude-sonnet-5-5` | Model that writes the ledger. |
 | `STRATA_LEDGER_REBUILD_EVERY` | `5` | Rebuild the ledger from the whole archive every N compactions (0 = never). Skipped for an incremental update once a rebuild would take more than 3 model requests, so long sessions don't pay a cost that keeps growing. |
 | `STRATA_TRIGGER_TOKENS` | `400000` | Plugin: compact on its own once the context passes this. |
@@ -87,6 +97,7 @@ claude --plugin-dir ./plugin --plugin-dir ./plugin-trigger
 - The archive holds full tool output, including anything sensitive that passed through the session. It stays local, but treat `~/.strata` like your transcripts.
 - Recognizing its own previous output depends on the engine returning those messages unchanged. One rewritten strata-built message is tolerated, but only when every later message of the previous output still matches by position. A rewind with an edited prompt regenerates everything after it, so it can't pass that check even when a reply happens to repeat. If recognition fails, everything after the mismatch is archived as new history, so it shows up twice. The plugin's log line and the `matched` stat show when this happened.
 - When nothing of the previous output comes back (a foreign compaction, or the conversation was replaced), the ledger is dropped and rebuilt from the new branch, because the old one may describe history that is no longer active.
+- The API form holds at most 4096 messages. Rows beyond that window get no image or thinking weight, which only matters for very old rows, and those are normally evicted anyway.
 - A response is detected by row patterns. The hook's message projection carries no response ID, so a response split by its own tool results may be cut into two units. The thinking-row protection above keeps the latest response intact. Older responses lose only their thinking blocks, which the API doesn't require for earlier turns. Reading the full API-form messages (`$.session.messages({ as: 'api' })`) would fix this and the image/document limit, at the cost of a larger refactor.
 - The ledger cursor advances only when an update succeeds, so a failed ledger call is retried on the next compaction.
 - The ledger is the only LLM-written layer and is updated from its previous version. The periodic full rebuild and the `#seq` citations bound how far it can drift, but they don't eliminate it.

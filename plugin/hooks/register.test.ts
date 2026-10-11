@@ -14,9 +14,26 @@ const BUILT_IN = { messages: [{ role: 'user' as const, text: 'built-in summary',
 type Call = { argv: readonly string[]; stdin?: string }
 
 /** The slice of `$` strataCompact touches; the test kit's `$` has no session.id. */
-function fakeEngine(result: ProcessRunResult, calls: Call[], logs: string[], env: Record<string, string> = {}): EngineInterface {
+const API_FORM = [{ role: 'user', content: [{ type: 'text', text: 'old prompt' }] }]
+const BREAKDOWN = {
+  tokens: 90_000,
+  window: 1_000_000,
+  breakdown: {
+    categories: [
+      { name: 'System prompt', tokens: 2_000, kind: 'used' },
+      { name: 'System tools', tokens: 40_000, kind: 'used' },
+      { name: 'Messages', tokens: 48_000, kind: 'used' },
+      { name: 'Free space', tokens: 910_000, kind: 'free' }
+    ]
+  }
+}
+
+function fakeEngine(result: ProcessRunResult, calls: Call[], logs: string[], env: Record<string, string> = {}, withSession = false): EngineInterface {
   return {
     env: { get: async (name: string) => env[name] },
+    ...(withSession
+      ? { session: { messages: async () => API_FORM, usage: async () => ({ startedAt: 0, context: BREAKDOWN, rateLimits: [] }) } }
+      : {}),
     plugin: { root: '/plugins/strata/plugin' },
     process: {
       run: async (argv: readonly string[], init?: { stdin?: string }) => {
@@ -46,7 +63,8 @@ describe('strataCompact', () => {
     expect(result.messages?.[1]?.handle).toBe('h1')
     expect(calls[0]?.argv).toEqual(['node', '/plugins/strata/plugin/bin/strata.mjs', 'compact', '--session', SESSION, '--in', '-', '--out', '-'])
     expect(JSON.parse(calls[0]?.stdin ?? '{}').messages).toHaveLength(3)
-    expect(logs[0]).toContain('strata:')
+    // The engine prefixes the plugin's name; the line itself is the result.
+    expect(logs.some(l => /branch text -> .* live/.test(l))).toBe(true)
   })
 
   test('falls back to the built-in compactor when the CLI fails', async () => {
@@ -77,6 +95,15 @@ describe('strataCompact', () => {
     const prep = calls.find(c => c.argv.includes('prepare'))
     expect(prep?.argv).toContain(SESSION)
     expect(JSON.parse(prep?.stdin ?? '{}').messages.map((m: { text: string }) => m.text)).toEqual([HEADER.text, 'latest prompt'])
+  })
+
+  test('sends the API form and the real token figures along with the rows', async () => {
+    const calls: Call[] = []
+    const stdout = JSON.stringify({ entries: [{ keep: 2 }], stats: { rawChars: 1, outputChars: 1, matched: 0, previousOutput: 0, cut: 0, ledgerThrough: 0 } })
+    await strataCompact(fakeEngine(cli(stdout), calls, [], {}, true), { trigger: 'manual', messages: MESSAGES }, builtIn, SESSION)
+    const sent = JSON.parse(calls[0]?.stdin ?? '{}')
+    expect(sent.api).toEqual(API_FORM)
+    expect(sent.usage).toEqual({ tokens: 90_000, overhead: 42_000 })
   })
 
   test('STRATA_AUTO=0 also stops the catch-up after a compaction', async () => {

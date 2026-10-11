@@ -1,6 +1,6 @@
 {
   "name": "strata-trigger",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Starts a strata compaction between turns once the context passes STRATA_TRIGGER_TOKENS",
   "author": {
     "name": "Tomasz Kasperczyk"

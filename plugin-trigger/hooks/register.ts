@@ -55,7 +55,7 @@ export const register: Register = on => {
     status.lastCheckedAt = now
     if (status.compactingSince !== undefined) {
       if (now - status.compactingSince < STUCK_AFTER_MS) return result
-      $.ui.log(`strata-trigger: a compaction started ${Math.round((now - status.compactingSince) / 60000)} min ago never settled; triggering again`)
+      $.ui.log(`a compaction started ${Math.round((now - status.compactingSince) / 60000)} min ago never settled; triggering again`)
     }
     if ((tokens ?? 0) < (await triggerTokens($))) return result
     status.compactingSince = now
@@ -69,7 +69,7 @@ export const register: Register = on => {
         .catch(error => {
           status.lastOutcome = `refused: ${describe(error)}`
           // Shown, not just debug-logged: a silent refusal looks exactly like "never triggered".
-          $.ui.log(`strata-trigger: compaction refused, will retry after the next turn: ${describe(error)}`)
+          $.ui.log(`compaction refused, will retry after the next turn: ${describe(error)}`)
         })
         .finally(() => (status.compactingSince = undefined))
     })

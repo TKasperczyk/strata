@@ -14,6 +14,22 @@ export type Unit = { start: number; end: number; kind: 'prompt' | 'exchange' }
 const NON_TEXT_PLACEHOLDER = (seq: number) =>
   `[strata: a message with non-text content (image or document) was here, seq ${seq}; only its text is archived]`
 
+function mediaNote(paths: string[]): string {
+  return `[strata: ${paths.length === 1 ? 'an image was' : `${paths.length} images were`} here, saved as ${paths.join(', ')}; open with Read to view]`
+}
+
+/** A rebuilt row loses its images: point at the files the archive saved instead. */
+function withMedia(row: ArchivedMessage, viewed: Message): Message {
+  if (!row.media?.length) return viewed
+  const loose = row.media.filter(m => m.toolUseId === undefined).map(m => m.path)
+  const text = loose.length ? [viewed.text, mediaNote(loose)].filter(Boolean).join('\n') : viewed.text
+  const toolResults = viewed.toolResults?.map(r => {
+    const paths = row.media!.filter(m => m.toolUseId === r.tool_use_id).map(m => m.path)
+    return paths.length ? { ...r, text: `${r.text}\n${mediaNote(paths)}` } : r
+  })
+  return { ...viewed, text, ...(toolResults ? { toolResults } : {}) }
+}
+
 export function isPrompt(m: Message): boolean {
   return m.role === 'user' && !(m.toolResults?.length)
 }
@@ -61,10 +77,10 @@ export type RebuildMode = 'raw' | 'masked'
  * are never emitted (the engine would turn them into "(no content)").
  */
 export function rebuildUnit(rows: ArchivedMessage[], mode: RebuildMode, config: Config): Message[] {
-  const view = (m: ArchivedMessage): Message => (mode === 'masked' ? maskMessage(m, m.seq, config) : m)
+  const view = (m: ArchivedMessage): Message => withMedia(m, mode === 'masked' ? maskMessage(m, m.seq, config) : m)
   if (rows.length === 1 && isPrompt(rows[0])) {
     const m = view(rows[0])
-    return [{ role: 'user', text: m.text || NON_TEXT_PLACEHOLDER(rows[0].seq), toolUses: [] }]
+    return [{ role: 'user', text: m.text.trim() ? m.text : NON_TEXT_PLACEHOLDER(rows[0].seq), toolUses: [] }]
   }
   const texts: string[] = []
   const uses: ToolUse[] = []

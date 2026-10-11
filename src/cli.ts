@@ -7,7 +7,8 @@ import { readArchive, sessionDir } from './archive.js'
 import { compact, DeclineError, prepare, type CompactStats, type LedgerFn } from './compact.js'
 import { estimateTokens, loadConfig } from './config.js'
 import { messageChars, renderMessage } from './mask.js'
-import { readTranscript } from './transcript.js'
+import { apiForm, readTranscriptWithBlocks } from './transcript.js'
+import { DEFAULT_THINKING_CHARS_PER_TOKEN, hiddenByRow, type ApiMessage, type UsageReading } from './weights.js'
 import type { Message } from './types.js'
 
 const USAGE = `strata - layered, budget-bounded compaction for Claude Code
@@ -53,13 +54,19 @@ async function runCompact(argv: string[]): Promise<void> {
   if (values.ledger !== undefined && values.ledger !== 'sync' && values.ledger !== 'ready') fail(`--ledger must be sync or ready, got ${values.ledger}`)
   const config = loadConfig(budgetOverride(values.budget))
   // `-` reads stdin / writes stdout, which is how the plugin calls it.
-  const { messages } = JSON.parse(readFileSync(values.in === '-' ? 0 : values.in, 'utf-8')) as { messages: Message[] }
+  const { messages, api, usage } = JSON.parse(readFileSync(values.in === '-' ? 0 : values.in, 'utf-8')) as {
+    messages: Message[]
+    api?: ApiMessage[]
+    usage?: UsageReading
+  }
   const result = await compact(
     {
       sessionKey: values.session,
       messages,
       ...(values.instructions ? { instructions: values.instructions } : {}),
       ...(values.ledger ? { ledgerMode: values.ledger } : {}),
+      ...(api ? { api } : {}),
+      ...(usage ? { usage } : {}),
       showCommand: SHOW_COMMAND(values.session)
     },
     config
@@ -94,7 +101,8 @@ function summarize(s: CompactStats): string {
   return [
     `archived ${s.archived} (+${s.newRaw}${s.matchedPrevious ? '' : `, matched ${s.matched}`}) branch ${s.branch}`,
     `raw ${k(s.rawChars)} -> out ${k(s.outputChars)}`,
-    `header ${k(s.layers.header)} middle ${k(s.layers.middle)} tail ${k(s.layers.tail)}`,
+    `header ${k(s.layers.header)} middle ${k(s.layers.middle)} tail ${k(s.layers.tail)}${s.hiddenChars ? ` (${k(s.hiddenChars)} images/thinking)` : ''}`,
+    s.mediaSaved ? `${s.mediaSaved} images archived` : '',
     `cut ${s.cut} tail@${s.tailStart}`,
     s.ledgerRequests ? `ledger x${s.ledgerRequests}` : '',
     s.ledgerThrough < s.cut ? `ledger lags ${s.cut - s.ledgerThrough} rows` : '',
@@ -129,8 +137,21 @@ async function runReplay(argv: string[]): Promise<void> {
   const config = loadConfig({ dataDir, ...budgetOverride(values.budget) })
   const trigger = values.trigger ? Number.parseInt(values.trigger, 10) : config.budgetTokens * 2
   const key = `replay-${basename(path, '.jsonl')}`
-  const raw = readTranscript(path)
-  const tokens = (ms: Message[]) => estimateTokens(ms.reduce((n, m) => n + messageChars(m), 0))
+  const { messages: raw, blocks } = readTranscriptWithBlocks(path)
+  // Live size as the engine would count it: text plus the images and thinking the rows hide,
+  // computed once per message (rows strata built carry none).
+  const weight = new Map<Message, number>()
+  const tokensOf = (m: Message) => {
+    let w = weight.get(m)
+    if (w === undefined) {
+      const hidden = hiddenByRow([m], apiForm([m], blocks)).get(0)
+      w = estimateTokens(messageChars(m)) + (hidden ? hidden.imageTokens + Math.round(hidden.thinkingChars / DEFAULT_THINKING_CHARS_PER_TOKEN) : 0)
+      weight.set(m, w)
+    }
+    return w
+  }
+  const tokens = (ms: Message[]) => ms.reduce((n, m) => n + tokensOf(m), 0)
+
 
   process.stdout.write(`${raw.length} messages, ${tokens(raw).toLocaleString('en-US')} est. tokens raw; budget ${config.budgetTokens}, trigger ${trigger}\n`)
   const ledgerFn = values['no-llm'] ? noLedger : undefined
@@ -151,7 +172,7 @@ async function runReplay(argv: string[]): Promise<void> {
     let result
     try {
       result = await compact(
-        { sessionKey: key, messages: live, showCommand: SHOW_COMMAND(key), ...(values.background ? { ledgerMode: 'ready' as const } : {}) },
+        { sessionKey: key, messages: live, api: apiForm(live, blocks), showCommand: SHOW_COMMAND(key), ...(values.background ? { ledgerMode: 'ready' as const } : {}) },
         config,
         ledgerFn
       )

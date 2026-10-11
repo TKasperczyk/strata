@@ -2,9 +2,9 @@
 // Bundled by esbuild from src/ (pnpm bundle); do not edit.
 
 // src/cli.ts
-import { mkdtempSync, readFileSync as readFileSync5, rmSync as rmSync2, writeFileSync as writeFileSync4 } from "fs";
+import { mkdtempSync, readFileSync as readFileSync5, rmSync as rmSync2, writeFileSync as writeFileSync5 } from "fs";
 import { tmpdir } from "os";
-import { basename, join as join5, resolve } from "path";
+import { basename, join as join6, resolve } from "path";
 import { parseArgs } from "util";
 
 // src/archive.ts
@@ -71,6 +71,10 @@ function matchedPrefix(input, state) {
   }
   return p;
 }
+
+// src/compact.ts
+import { mkdirSync as mkdirSync3, writeFileSync as writeFileSync4 } from "fs";
+import { join as join5 } from "path";
 
 // src/config.ts
 import { homedir } from "os";
@@ -6635,6 +6639,20 @@ function tryLock(dir) {
 
 // src/units.ts
 var NON_TEXT_PLACEHOLDER = (seq) => `[strata: a message with non-text content (image or document) was here, seq ${seq}; only its text is archived]`;
+function mediaNote(paths) {
+  return `[strata: ${paths.length === 1 ? "an image was" : `${paths.length} images were`} here, saved as ${paths.join(", ")}; open with Read to view]`;
+}
+function withMedia(row, viewed) {
+  if (!row.media?.length) return viewed;
+  const loose = row.media.filter((m) => m.toolUseId === void 0).map((m) => m.path);
+  const text = loose.length ? [viewed.text, mediaNote(loose)].filter(Boolean).join("\n") : viewed.text;
+  const toolResults = viewed.toolResults?.map((r) => {
+    const paths = row.media.filter((m) => m.toolUseId === r.tool_use_id).map((m) => m.path);
+    return paths.length ? { ...r, text: `${r.text}
+${mediaNote(paths)}` } : r;
+  });
+  return { ...viewed, text, ...toolResults ? { toolResults } : {} };
+}
 function isPrompt2(m) {
   return m.role === "user" && !m.toolResults?.length;
 }
@@ -6664,10 +6682,10 @@ function segmentUnits(rows, whole = []) {
   return units;
 }
 function rebuildUnit(rows, mode, config) {
-  const view = (m) => mode === "masked" ? maskMessage(m, m.seq, config) : m;
+  const view = (m) => withMedia(m, mode === "masked" ? maskMessage(m, m.seq, config) : m);
   if (rows.length === 1 && isPrompt2(rows[0])) {
     const m = view(rows[0]);
-    return [{ role: "user", text: m.text || NON_TEXT_PLACEHOLDER(rows[0].seq), toolUses: [] }];
+    return [{ role: "user", text: m.text.trim() ? m.text : NON_TEXT_PLACEHOLDER(rows[0].seq), toolUses: [] }];
   }
   const texts = [];
   const uses = [];
@@ -6696,6 +6714,133 @@ function rebuildUnit(rows, mode, config) {
 }
 function unitChars(messages) {
   return messages.reduce((n, m) => n + messageChars(m), 0);
+}
+
+// src/weights.ts
+var DEFAULT_THINKING_CHARS_PER_TOKEN = 4;
+var RATIO_BOUNDS = [1.5, 8];
+var UNKNOWN_IMAGE_TOKENS = 1600;
+var PIXELS_PER_TOKEN = 750;
+function imageDimensions(base64) {
+  const head = Buffer.from(base64.slice(0, 12e4), "base64");
+  if (head.length > 24 && head.readUInt32BE(0) === 2303741511) return [head.readUInt32BE(16), head.readUInt32BE(20)];
+  if (head.length > 10 && head.toString("ascii", 0, 3) === "GIF") return [head.readUInt16LE(6), head.readUInt16LE(8)];
+  if (head.length > 30 && head.toString("ascii", 0, 4) === "RIFF" && head.toString("ascii", 8, 12) === "WEBP") {
+    const kind = head.toString("ascii", 12, 16);
+    if (kind === "VP8X") return [1 + head.readUIntLE(24, 3), 1 + head.readUIntLE(27, 3)];
+    if (kind === "VP8 ") return [head.readUInt16LE(26) & 16383, head.readUInt16LE(28) & 16383];
+    if (kind === "VP8L") {
+      const bits = head.readUInt32LE(21);
+      return [1 + (bits & 16383), 1 + (bits >> 14 & 16383)];
+    }
+  }
+  if (head.length > 4 && head[0] === 255 && head[1] === 216) {
+    let i = 2;
+    while (i + 9 < head.length) {
+      if (head[i] !== 255) {
+        i++;
+        continue;
+      }
+      const marker = head[i + 1];
+      if (marker >= 192 && marker <= 195) return [head.readUInt16BE(i + 7), head.readUInt16BE(i + 5)];
+      i += 2 + head.readUInt16BE(i + 2);
+    }
+  }
+  return void 0;
+}
+function imageTokens(base64) {
+  const size = imageDimensions(base64);
+  return size ? Math.ceil(size[0] * size[1] / PIXELS_PER_TOKEN) : UNKNOWN_IMAGE_TOKENS;
+}
+function imageRef(block, toolUseId) {
+  const source = block.source;
+  if (block.type !== "image" || source?.type !== "base64" || typeof source.data !== "string") return void 0;
+  return { ...toolUseId ? { toolUseId } : {}, mediaType: source.media_type ?? "image/png", data: source.data };
+}
+function thinkingChars(block) {
+  if (block.type === "thinking") return String(block.signature ?? "").length + String(block.thinking ?? "").length;
+  if (block.type === "redacted_thinking") return String(block.data ?? "").length;
+  return 0;
+}
+function emptyHidden() {
+  return { imageTokens: 0, thinkingChars: 0, images: [] };
+}
+function hiddenByRow(input, api) {
+  const hidden = /* @__PURE__ */ new Map();
+  const at = (row) => {
+    let h = hidden.get(row);
+    if (!h) hidden.set(row, h = emptyHidden());
+    return h;
+  };
+  const callRow = /* @__PURE__ */ new Map();
+  const resultRow = /* @__PURE__ */ new Map();
+  input.forEach((m, i) => {
+    for (const u of m.toolUses) callRow.set(u.tool_use_id, i);
+    for (const r of m.toolResults ?? []) resultRow.set(r.tool_use_id, i);
+  });
+  let cursor = 0;
+  const findForward = (test) => {
+    for (let i = cursor; i < input.length; i++) if (test(input[i])) return i;
+    return void 0;
+  };
+  for (const message of api) {
+    if (message.role === "assistant") {
+      const thinking = message.content.reduce((n, b) => n + thinkingChars(b), 0);
+      const firstCall = message.content.find((b) => b.type === "tool_use");
+      const firstText = message.content.find((b) => b.type === "text" && String(b.text ?? "").trim());
+      let anchor = firstCall ? callRow.get(String(firstCall.id)) : void 0;
+      if (anchor === void 0 && firstText) {
+        const text = String(firstText.text).trim();
+        anchor = findForward((m) => m.role === "assistant" && m.text.trim() === text);
+      }
+      anchor ??= findForward((m) => m.role === "assistant");
+      if (anchor === void 0) continue;
+      cursor = anchor;
+      if (thinking) at(anchor).thinkingChars += thinking;
+      continue;
+    }
+    let promptAnchor;
+    for (const block of message.content) {
+      if (block.type === "tool_result") {
+        const id = String(block.tool_use_id);
+        const row = resultRow.get(id);
+        if (row === void 0) continue;
+        cursor = Math.max(cursor, row);
+        const content = Array.isArray(block.content) ? block.content : [];
+        for (const inner of content) {
+          const ref = imageRef(inner, id);
+          if (!ref) continue;
+          at(row).images.push(ref);
+          at(row).imageTokens += imageTokens(ref.data);
+        }
+      } else if (block.type === "text" && promptAnchor === void 0) {
+        const text = String(block.text ?? "").trim();
+        if (text) promptAnchor = findForward((m) => m.role === "user" && !m.toolResults?.length && m.text.trim() === text);
+      } else if (block.type === "image") {
+        const ref = imageRef(block);
+        if (!ref) continue;
+        const row = promptAnchor ?? findForward((m) => m.role === "user" && !m.toolResults?.length && !m.text.trim());
+        if (row === void 0) continue;
+        cursor = row;
+        at(row).images.push(ref);
+        at(row).imageTokens += imageTokens(ref.data);
+      }
+    }
+    if (promptAnchor !== void 0) cursor = promptAnchor;
+  }
+  return hidden;
+}
+function thinkingRatio(input, hidden, usage) {
+  const thinking = [...hidden.values()].reduce((n, h) => n + h.thinkingChars, 0);
+  if (!thinking || usage?.tokens === void 0 || usage.overhead === void 0) return DEFAULT_THINKING_CHARS_PER_TOKEN;
+  const visible = input.reduce((n, m) => n + messageChars(m), 0) / CHARS_PER_TOKEN + [...hidden.values()].reduce((n, h) => n + h.imageTokens, 0);
+  const thinkingTokens = usage.tokens - usage.overhead - visible;
+  if (thinkingTokens <= 0) return DEFAULT_THINKING_CHARS_PER_TOKEN;
+  return Math.min(RATIO_BOUNDS[1], Math.max(RATIO_BOUNDS[0], thinking / thinkingTokens));
+}
+function hiddenChars(h, ratio) {
+  if (!h) return 0;
+  return Math.round((h.imageTokens + h.thinkingChars / ratio) * CHARS_PER_TOKEN);
 }
 
 // src/compact.ts
@@ -6731,7 +6876,7 @@ function reconcile(dir, input, state) {
 }
 var SECTION_TITLE_SLACK = 200;
 function headerPreamble(input, dir) {
-  return `${HEADER_MARK} Older turns of this session were moved out of context. Every message's text is archived in ${archivePath(dir)} (one JSON message per line; line N+1 is seq N). Print one with \`${input.showCommand} <seq> [<last-seq>]\`. "[strata elided \u2026]" markers in the turns below point to archived tool results; read the archive or re-run the tool when you need the exact text. Never treat the index or ledger as proof that work happened: verify against files, git, or the archive before relying on it.`;
+  return `${HEADER_MARK} Older turns of this session were moved out of context. Every message's text is archived in ${archivePath(dir)} (one JSON message per line; line N+1 is seq N), and its images as files under ${join5(dir, "media")}. Print one with \`${input.showCommand} <seq> [<last-seq>]\`. "[strata elided \u2026]" markers in the turns below point to archived tool results; read the archive or re-run the tool when you need the exact text. Never treat the index or ledger as proof that work happened: verify against files, git, or the archive before relying on it.`;
 }
 function buildHeader(input, dir, evicted, ledger, ledgerThrough, config) {
   const pinned = evicted.find(isPrompt3);
@@ -6822,7 +6967,19 @@ function planCompaction(input, config) {
   const dir = sessionDir(config.dataDir, input.sessionKey);
   const state = readState(dir);
   const reconciled = reconcile(dir, input.messages, state);
-  const { all, branch, inputBySeq } = reconciled;
+  const { all, branch, inputBySeq, pending } = reconciled;
+  const hidden = input.api ? hiddenByRow(input.messages, input.api) : /* @__PURE__ */ new Map();
+  const ratio = thinkingRatio(input.messages, hidden, input.usage);
+  const mediaWrites = [];
+  for (const row of pending) {
+    const images = hidden.get(inputBySeq.get(row.seq))?.images ?? [];
+    if (!images.length) continue;
+    row.media = images.map((image, k) => {
+      const path2 = join5(dir, "media", `${row.seq}-${k}.${image.mediaType.split("/")[1] ?? "png"}`);
+      mediaWrites.push({ path: path2, data: image.data });
+      return { ...image.toolUseId ? { toolUseId: image.toolUseId } : {}, path: path2 };
+    });
+  }
   const rows = branch.map((seq) => all[seq]);
   const units = segmentUnits(rows, rows.map((m) => inputBySeq.has(m.seq)));
   if (units.length === 0) throw new Error("nothing to compact");
@@ -6834,7 +6991,8 @@ function planCompaction(input, config) {
   }
   const rawBuilt = units.map((u) => rebuildUnit(rows.slice(u.start, u.end), "raw", config));
   const maskedBuilt = units.map((u) => rebuildUnit(rows.slice(u.start, u.end), "masked", config));
-  const verbatim = units.map((u, k) => whole[k] ? rows.slice(u.start, u.end).reduce((n, m) => n + messageChars(m), 0) : unitChars(rawBuilt[k]));
+  const rowChars = (m) => messageChars(m) + hiddenChars(hidden.get(inputBySeq.get(m.seq)), ratio);
+  const verbatim = units.map((u, k) => whole[k] ? rows.slice(u.start, u.end).reduce((n, m) => n + rowChars(m), 0) : unitChars(rawBuilt[k]));
   const budget = budgetChars(config);
   const fixed = [verbatim, maskedBuilt.map(unitChars), guard.from, headerBoundWithoutLedger(input, dir, config)];
   let picked;
@@ -6844,11 +7002,11 @@ function planCompaction(input, config) {
     if (!(error instanceof OversizeError)) throw error;
     picked = layout(...fixed, budget, config);
   }
-  return { dir, state, reconciled, rows, units, handles, whole, rawBuilt, maskedBuilt, verbatim, ...picked, cutRow: units[picked.cut].start };
+  return { hidden, ratio, mediaWrites, dir, state, reconciled, rows, units, handles, whole, rawBuilt, maskedBuilt, verbatim, ...picked, cutRow: units[picked.cut].start };
 }
 async function compact(input, config, ledgerFn = updateLedger) {
   const plan = planCompaction(input, config);
-  const { dir, state, rows, units, handles, whole, rawBuilt, maskedBuilt, verbatim, cut: cut2, tail, cutRow } = plan;
+  const { dir, state, rows, units, handles, whole, rawBuilt, maskedBuilt, verbatim, cut: cut2, tail, cutRow, hidden, ratio, mediaWrites } = plan;
   const { all, pending, branch, matched, ledgerStale } = plan.reconciled;
   const tailRow = units[tail].start;
   const budget = budgetChars(config);
@@ -6857,6 +7015,7 @@ async function compact(input, config, ledgerFn = updateLedger) {
   const entries = [];
   const records = [];
   const layers = { header: 0, middle: 0, tail: 0 };
+  let tailHidden = 0;
   const emitBuilt = (m, upto, layer) => {
     entries.push({ built: m });
     records.push({ fp: fingerprint(m), upto, seq: -1 });
@@ -6873,7 +7032,9 @@ async function compact(input, config, ledgerFn = updateLedger) {
         body.push(() => {
           entries.push({ keep: inputIndex });
           records.push({ fp: fingerprint(input.messages[inputIndex]), upto: start + k + 1, seq: rows[start + k].seq });
-          layers.tail += messageChars(rows[start + k]);
+          const extra = hiddenChars(hidden.get(inputIndex), ratio);
+          tailHidden += extra;
+          layers.tail += messageChars(rows[start + k]) + extra;
         });
       });
     } else {
@@ -6890,6 +7051,8 @@ async function compact(input, config, ledgerFn = updateLedger) {
   for (const emit of body) emit();
   const outputChars = layers.header + layers.middle + layers.tail;
   if (outputChars > budget) throw new OversizeError(`assembled output is ${outputChars} chars, over the ${budget}-char budget`);
+  if (mediaWrites.length) mkdirSync3(join5(dir, "media"), { recursive: true });
+  for (const { path: path2, data } of mediaWrites) writeFileSync4(path2, Buffer.from(data, "base64"));
   appendArchive(dir, pending);
   writeState(dir, {
     branch,
@@ -6913,6 +7076,9 @@ async function compact(input, config, ledgerFn = updateLedger) {
       rawChars: rows.reduce((n, m) => n + messageChars(m), 0),
       outputChars,
       layers,
+      hiddenChars: tailHidden,
+      thinkingRatio: Math.round(ratio * 100) / 100,
+      mediaSaved: mediaWrites.length,
       ledgerRequests: ledger.requests,
       ledgerThrough: ledger.ledgerThrough,
       ...ledger.error ? { ledgerError: ledger.error } : {}
@@ -6953,8 +7119,9 @@ function resultText(content) {
   }
   return "";
 }
-function readTranscript(path2) {
+function readTranscriptWithBlocks(path2) {
   const messages = [];
+  const blockMap = /* @__PURE__ */ new Map();
   const toolUses = /* @__PURE__ */ new Map();
   for (const line of readFileSync4(path2, "utf-8").split("\n")) {
     if (!line.trim()) continue;
@@ -6971,6 +7138,7 @@ function readTranscript(path2) {
     if (row.type === "assistant") {
       const target = { role: "assistant", text: "", toolUses: [] };
       messages.push(target);
+      blockMap.set(target, blocks);
       for (const b of blocks) {
         if (b.type === "text" && b.text) target.text = target.text ? `${target.text}
 ${b.text}` : b.text;
@@ -6991,10 +7159,23 @@ ${b.text}` : b.text;
         if (r.isError) use.isError = true;
       }
     }
-    if (!text && results.length === 0) continue;
-    messages.push({ role: "user", text, toolUses: [], ...results.length ? { toolResults: results } : {} });
+    const hasMedia = blocks.some((b) => b.type === "image" || b.type === "document");
+    if (!text && results.length === 0 && !hasMedia) continue;
+    const message = { role: "user", text, toolUses: [], ...results.length ? { toolResults: results } : {} };
+    messages.push(message);
+    blockMap.set(message, blocks);
   }
-  return messages;
+  return { messages, blocks: blockMap };
+}
+function apiForm(live, blocks) {
+  const api = [];
+  for (const m of live) {
+    const own = blocks.get(m) ?? [{ type: "text", text: m.text }];
+    const last = api.at(-1);
+    if (last && last.role === m.role) last.content.push(...own);
+    else api.push({ role: m.role, content: [...own] });
+  }
+  return api;
 }
 
 // src/cli.ts
@@ -7038,19 +7219,21 @@ async function runCompact(argv) {
   if (!values.session || !values.in || !values.out) fail("compact needs --session, --in and --out");
   if (values.ledger !== void 0 && values.ledger !== "sync" && values.ledger !== "ready") fail(`--ledger must be sync or ready, got ${values.ledger}`);
   const config = loadConfig(budgetOverride(values.budget));
-  const { messages } = JSON.parse(readFileSync5(values.in === "-" ? 0 : values.in, "utf-8"));
+  const { messages, api, usage } = JSON.parse(readFileSync5(values.in === "-" ? 0 : values.in, "utf-8"));
   const result = await compact(
     {
       sessionKey: values.session,
       messages,
       ...values.instructions ? { instructions: values.instructions } : {},
       ...values.ledger ? { ledgerMode: values.ledger } : {},
+      ...api ? { api } : {},
+      ...usage ? { usage } : {},
       showCommand: SHOW_COMMAND(values.session)
     },
     config
   );
   if (values.out === "-") process.stdout.write(JSON.stringify(result));
-  else writeFileSync4(values.out, JSON.stringify(result));
+  else writeFileSync5(values.out, JSON.stringify(result));
   process.stderr.write(`[strata] ${summarize(result.stats)}
 `);
 }
@@ -7077,7 +7260,8 @@ function summarize(s) {
   return [
     `archived ${s.archived} (+${s.newRaw}${s.matchedPrevious ? "" : `, matched ${s.matched}`}) branch ${s.branch}`,
     `raw ${k(s.rawChars)} -> out ${k(s.outputChars)}`,
-    `header ${k(s.layers.header)} middle ${k(s.layers.middle)} tail ${k(s.layers.tail)}`,
+    `header ${k(s.layers.header)} middle ${k(s.layers.middle)} tail ${k(s.layers.tail)}${s.hiddenChars ? ` (${k(s.hiddenChars)} images/thinking)` : ""}`,
+    s.mediaSaved ? `${s.mediaSaved} images archived` : "",
     `cut ${s.cut} tail@${s.tailStart}`,
     s.ledgerRequests ? `ledger x${s.ledgerRequests}` : "",
     s.ledgerThrough < s.cut ? `ledger lags ${s.cut - s.ledgerThrough} rows` : "",
@@ -7099,12 +7283,22 @@ async function runReplay(argv) {
   });
   const path2 = positionals[0];
   if (!path2) fail("replay needs a transcript path");
-  const dataDir = mkdtempSync(join5(tmpdir(), "strata-replay-"));
+  const dataDir = mkdtempSync(join6(tmpdir(), "strata-replay-"));
   const config = loadConfig({ dataDir, ...budgetOverride(values.budget) });
   const trigger = values.trigger ? Number.parseInt(values.trigger, 10) : config.budgetTokens * 2;
   const key = `replay-${basename(path2, ".jsonl")}`;
-  const raw = readTranscript(path2);
-  const tokens = (ms) => estimateTokens(ms.reduce((n, m) => n + messageChars(m), 0));
+  const { messages: raw, blocks } = readTranscriptWithBlocks(path2);
+  const weight = /* @__PURE__ */ new Map();
+  const tokensOf = (m) => {
+    let w = weight.get(m);
+    if (w === void 0) {
+      const hidden = hiddenByRow([m], apiForm([m], blocks)).get(0);
+      w = estimateTokens(messageChars(m)) + (hidden ? hidden.imageTokens + Math.round(hidden.thinkingChars / DEFAULT_THINKING_CHARS_PER_TOKEN) : 0);
+      weight.set(m, w);
+    }
+    return w;
+  };
+  const tokens = (ms) => ms.reduce((n, m) => n + tokensOf(m), 0);
   process.stdout.write(`${raw.length} messages, ${tokens(raw).toLocaleString("en-US")} est. tokens raw; budget ${config.budgetTokens}, trigger ${trigger}
 `);
   const ledgerFn = values["no-llm"] ? noLedger : void 0;
@@ -7126,7 +7320,7 @@ async function runReplay(argv) {
     let result;
     try {
       result = await compact(
-        { sessionKey: key, messages: live, showCommand: SHOW_COMMAND(key), ...values.background ? { ledgerMode: "ready" } : {} },
+        { sessionKey: key, messages: live, api: apiForm(live, blocks), showCommand: SHOW_COMMAND(key), ...values.background ? { ledgerMode: "ready" } : {} },
         config,
         ledgerFn
       );

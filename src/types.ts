@@ -22,8 +22,11 @@ export type Message = {
   toolResults?: ToolResult[]
 }
 
+/** An image the archive saved as a file: a tool result's (by id) or a prompt's. */
+export type MediaRef = { toolUseId?: string; path: string }
+
 /** A raw message as the archive stores it: one per line, `seq` = line index. */
-export type ArchivedMessage = Message & { seq: number }
+export type ArchivedMessage = Message & { seq: number; media?: MediaRef[] }
 
 /**
  * One entry of the compacted conversation the CLI hands back: either "keep the

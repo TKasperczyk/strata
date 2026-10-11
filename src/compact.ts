@@ -1,3 +1,5 @@
+import { mkdirSync, writeFileSync } from 'fs'
+import { join } from 'path'
 import { appendArchive, archivePath, fingerprint, matchedPrefix, numberMessages, readArchive, readState, sessionDir, writeState } from './archive.js'
 import { budgetChars, shareChars, type Config } from './config.js'
 import { renderIndex, segmentEpisodes } from './episodes.js'
@@ -6,6 +8,7 @@ import { messageChars } from './mask.js'
 import { compatibleReady, prefixHash, tryLock, writeReady } from './ready.js'
 import type { ArchivedMessage, Message, OutputEntry, OutputRecord, SessionState } from './types.js'
 import { isPrompt as isUnitPrompt, rebuildUnit, segmentUnits, unitChars, type Unit } from './units.js'
+import { hiddenByRow, hiddenChars, thinkingRatio, type ApiMessage, type Hidden, type UsageReading } from './weights.js'
 
 export const HEADER_MARK = '[strata: compacted conversation]'
 
@@ -21,6 +24,13 @@ export type CompactInput = {
    * compaction is instant and the ledger may lag the cut.
    */
   ledgerMode?: 'sync' | 'ready'
+  /**
+   * The same conversation in Messages API form, and the engine's real token
+   * figures: what lets strata count the images and thinking the rows leave
+   * out, and archive the images. Without them strata budgets text alone.
+   */
+  api?: ApiMessage[]
+  usage?: UsageReading
 }
 
 export type CompactStats = {
@@ -38,6 +48,12 @@ export type CompactStats = {
   rawChars: number
   outputChars: number
   layers: { header: number; middle: number; tail: number }
+  /** Of the tail, what images and thinking weigh (char units): invisible in the rows. */
+  hiddenChars: number
+  /** Thinking signature chars per token, calibrated against the real window. */
+  thinkingRatio: number
+  /** Images saved to the archive's media folder by this compaction. */
+  mediaSaved: number
   ledgerRequests: number
   /** Branch rows the ledger covers; less than `cut` when it lags. */
   ledgerThrough: number
@@ -103,7 +119,7 @@ function reconcile(dir: string, input: Message[], state: SessionState): Reconcil
 const SECTION_TITLE_SLACK = 200
 
 function headerPreamble(input: CompactInput, dir: string): string {
-  return `${HEADER_MARK} Older turns of this session were moved out of context. Every message's text is archived in ${archivePath(dir)} (one JSON message per line; line N+1 is seq N). Print one with \`${input.showCommand} <seq> [<last-seq>]\`. "[strata elided …]" markers in the turns below point to archived tool results; read the archive or re-run the tool when you need the exact text. Never treat the index or ledger as proof that work happened: verify against files, git, or the archive before relying on it.`
+  return `${HEADER_MARK} Older turns of this session were moved out of context. Every message's text is archived in ${archivePath(dir)} (one JSON message per line; line N+1 is seq N), and its images as files under ${join(dir, 'media')}. Print one with \`${input.showCommand} <seq> [<last-seq>]\`. "[strata elided …]" markers in the turns below point to archived tool results; read the archive or re-run the tool when you need the exact text. Never treat the index or ledger as proof that work happened: verify against files, git, or the archive before relying on it.`
 }
 
 function buildHeader(input: CompactInput, dir: string, evicted: ArchivedMessage[], ledger: string, ledgerThrough: number, config: Config): string {
@@ -235,6 +251,10 @@ async function advanceLedger(
 }
 
 type Plan = {
+  hidden: Map<number, Hidden>
+  ratio: number
+  /** Image files to write at commit, for rows archived by this compaction. */
+  mediaWrites: Array<{ path: string; data: string }>
   dir: string
   state: SessionState
   reconciled: Reconciled
@@ -255,7 +275,20 @@ function planCompaction(input: CompactInput, config: Config): Plan {
   const dir = sessionDir(config.dataDir, input.sessionKey)
   const state = readState(dir)
   const reconciled = reconcile(dir, input.messages, state)
-  const { all, branch, inputBySeq } = reconciled
+  const { all, branch, inputBySeq, pending } = reconciled
+  const hidden = input.api ? hiddenByRow(input.messages, input.api) : new Map<number, Hidden>()
+  const ratio = thinkingRatio(input.messages, hidden, input.usage)
+  // New rows carrying images get archive files; rebuilt copies will point at them.
+  const mediaWrites: Array<{ path: string; data: string }> = []
+  for (const row of pending) {
+    const images = hidden.get(inputBySeq.get(row.seq)!)?.images ?? []
+    if (!images.length) continue
+    row.media = images.map((image, k) => {
+      const path = join(dir, 'media', `${row.seq}-${k}.${image.mediaType.split('/')[1] ?? 'png'}`)
+      mediaWrites.push({ path, data: image.data })
+      return { ...(image.toolUseId ? { toolUseId: image.toolUseId } : {}), path }
+    })
+  }
   const rows = branch.map(seq => all[seq])
   const units = segmentUnits(rows, rows.map(m => inputBySeq.has(m.seq)))
   if (units.length === 0) throw new Error('nothing to compact')
@@ -270,7 +303,9 @@ function planCompaction(input: CompactInput, config: Config): Plan {
   }
   const rawBuilt = units.map(u => rebuildUnit(rows.slice(u.start, u.end), 'raw', config))
   const maskedBuilt = units.map(u => rebuildUnit(rows.slice(u.start, u.end), 'masked', config))
-  const verbatim = units.map((u, k) => (whole[k] ? rows.slice(u.start, u.end).reduce((n, m) => n + messageChars(m), 0) : unitChars(rawBuilt[k])))
+  // A row kept whole goes back with its images and thinking: count them too.
+  const rowChars = (m: ArchivedMessage) => messageChars(m) + hiddenChars(hidden.get(inputBySeq.get(m.seq)!), ratio)
+  const verbatim = units.map((u, k) => (whole[k] ? rows.slice(u.start, u.end).reduce((n, m) => n + rowChars(m), 0) : unitChars(rawBuilt[k])))
   const budget = budgetChars(config)
   const fixed = [verbatim, maskedBuilt.map(unitChars), guard.from, headerBoundWithoutLedger(input, dir, config)] as const
   // Leave the ledger its share when there is room; squeeze it out before giving up.
@@ -281,12 +316,12 @@ function planCompaction(input: CompactInput, config: Config): Plan {
     if (!(error instanceof OversizeError)) throw error
     picked = layout(...fixed, budget, config)
   }
-  return { dir, state, reconciled, rows, units, handles, whole, rawBuilt, maskedBuilt, verbatim, ...picked, cutRow: units[picked.cut].start }
+  return { hidden, ratio, mediaWrites, dir, state, reconciled, rows, units, handles, whole, rawBuilt, maskedBuilt, verbatim, ...picked, cutRow: units[picked.cut].start }
 }
 
 export async function compact(input: CompactInput, config: Config, ledgerFn: LedgerFn = updateLedger): Promise<CompactResult> {
   const plan = planCompaction(input, config)
-  const { dir, state, rows, units, handles, whole, rawBuilt, maskedBuilt, verbatim, cut, tail, cutRow } = plan
+  const { dir, state, rows, units, handles, whole, rawBuilt, maskedBuilt, verbatim, cut, tail, cutRow, hidden, ratio, mediaWrites } = plan
   const { all, pending, branch, matched, ledgerStale } = plan.reconciled
   const tailRow = units[tail].start
   const budget = budgetChars(config)
@@ -297,6 +332,7 @@ export async function compact(input: CompactInput, config: Config, ledgerFn: Led
   const entries: OutputEntry[] = []
   const records: OutputRecord[] = []
   const layers = { header: 0, middle: 0, tail: 0 }
+  let tailHidden = 0
   const emitBuilt = (m: Message, upto: number, layer: keyof typeof layers) => {
     entries.push({ built: m })
     records.push({ fp: fingerprint(m), upto, seq: -1 })
@@ -314,7 +350,9 @@ export async function compact(input: CompactInput, config: Config, ledgerFn: Led
         body.push(() => {
           entries.push({ keep: inputIndex! })
           records.push({ fp: fingerprint(input.messages[inputIndex!]), upto: start + k + 1, seq: rows[start + k].seq })
-          layers.tail += messageChars(rows[start + k])
+          const extra = hiddenChars(hidden.get(inputIndex!), ratio)
+          tailHidden += extra
+          layers.tail += messageChars(rows[start + k]) + extra
         })
       })
     } else {
@@ -334,6 +372,8 @@ export async function compact(input: CompactInput, config: Config, ledgerFn: Led
   if (outputChars > budget) throw new OversizeError(`assembled output is ${outputChars} chars, over the ${budget}-char budget`)
 
   // Commit only now: a rejected compaction leaves archive and state untouched.
+  if (mediaWrites.length) mkdirSync(join(dir, 'media'), { recursive: true })
+  for (const { path, data } of mediaWrites) writeFileSync(path, Buffer.from(data, 'base64'))
   appendArchive(dir, pending)
   writeState(dir, {
     branch,
@@ -358,6 +398,9 @@ export async function compact(input: CompactInput, config: Config, ledgerFn: Led
       rawChars: rows.reduce((n, m) => n + messageChars(m), 0),
       outputChars,
       layers,
+      hiddenChars: tailHidden,
+      thinkingRatio: Math.round(ratio * 100) / 100,
+      mediaSaved: mediaWrites.length,
       ledgerRequests: ledger.requests,
       ledgerThrough: ledger.ledgerThrough,
       ...(ledger.error ? { ledgerError: ledger.error } : {})

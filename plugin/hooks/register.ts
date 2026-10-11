@@ -17,7 +17,17 @@ type Built = Pick<SessionMessage, 'role' | 'text' | 'toolUses' | 'toolResults'>
 type Entry = { keep: number } | { built: Built }
 type CliResult = {
   entries: Entry[]
-  stats: { outputChars: number; rawChars: number; matched: number; previousOutput: number; cut: number; ledgerThrough: number; ledgerError?: string }
+  stats: {
+    outputChars: number
+    rawChars: number
+    matched: number
+    previousOutput: number
+    cut: number
+    ledgerThrough: number
+    hiddenChars?: number
+    mediaSaved?: number
+    ledgerError?: string
+  }
 }
 
 function plain(m: SessionMessage): Built {
@@ -47,7 +57,7 @@ export async function prepareLedger($: EngineInterface, session: string, message
     stdin: JSON.stringify({ messages: snapshot }),
     timeoutMs: PREPARE_TIMEOUT_MS
   })
-  $.ui.log(`strata: ledger prep ${run.exitCode === 0 ? run.stdout.trim() : `failed (exit ${run.exitCode}): ${run.stderr.slice(-300)}`}`, { to: 'debug' })
+  $.ui.log(`ledger prep ${run.exitCode === 0 ? run.stdout.trim() : `failed (exit ${run.exitCode}): ${run.stderr.slice(-300)}`}`, { to: 'debug' })
 }
 
 // One background ledger job in flight per module instance; the CLI also locks per session.
@@ -58,9 +68,29 @@ function prepareInBackground($: EngineInterface, session: string, messages?: Bui
   preparing = true
   $.clock.after(0, () => {
     prepareLedger($, session, messages)
-      .catch(error => $.ui.log(`strata: ledger prep failed: ${String(error)}`, { to: 'debug' }))
+      .catch(error => $.ui.log(`ledger prep failed: ${String(error)}`, { to: 'debug' }))
       .finally(() => (preparing = false))
   })
+}
+
+/**
+ * What the rows leave out: the conversation in Messages API form (images,
+ * thinking) and the engine's real token figures to calibrate against. Best
+ * effort: without it strata budgets the rows' text alone, as before.
+ */
+async function hiddenContext($: EngineInterface): Promise<{ api?: unknown; usage?: { tokens?: number; overhead?: number } }> {
+  try {
+    const [api, usage] = await Promise.all([$.session.messages({ as: 'api' }), $.session.usage({ breakdown: 'summary' })])
+    const categories = usage.context.breakdown?.categories ?? []
+    const messages = categories.find(c => c.name === 'Messages')
+    const overhead = messages
+      ? categories.filter(c => c.kind === 'used' && c !== messages).reduce((n, c) => n + c.tokens, 0)
+      : undefined
+    return { api, usage: { ...(usage.context.tokens !== undefined ? { tokens: usage.context.tokens } : {}), ...(overhead !== undefined ? { overhead } : {}) } }
+  } catch (error) {
+    $.ui.log(`could not read the API form, budgeting text only: ${String(error)}`, { to: 'debug' })
+    return {}
+  }
 }
 
 /** The hook's work, split out so tests can supply the session id the test kit lacks. */
@@ -76,11 +106,11 @@ export async function strataCompact(
   // background job prepared. /compact may take the time to bring it up to date.
   if (e.trigger === 'plugin') argv.push('--ledger', 'ready')
   const run = await $.process.run(argv, {
-    stdin: JSON.stringify({ messages: e.messages.map(plain) }),
+    stdin: JSON.stringify({ messages: e.messages.map(plain), ...(await hiddenContext($)) }),
     timeoutMs: CLI_TIMEOUT_MS
   })
   if (run.exitCode !== 0 || run.isStdoutTruncated) {
-    $.ui.log(`strata: compaction failed (exit ${run.exitCode}), using the built-in compactor. ${run.stderr.slice(-500)}`)
+    $.ui.log(`compaction failed (exit ${run.exitCode}), using the built-in compactor. ${run.stderr.slice(-500)}`)
     return next(e)
   }
   const result = JSON.parse(run.stdout) as CliResult
@@ -88,19 +118,21 @@ export async function strataCompact(
   for (const entry of result.entries) {
     const message = 'keep' in entry ? e.messages[entry.keep] : entry.built
     if (!message) {
-      $.ui.log('strata: CLI referenced a message that does not exist, using the built-in compactor')
+      $.ui.log('the CLI referenced a message that does not exist, using the built-in compactor')
       return next(e)
     }
     messages.push(message)
   }
   const k = (chars: number) => `${Math.round(chars / CHARS_PER_KTOKEN)}k`
-  const { rawChars, outputChars, matched, previousOutput, cut, ledgerThrough, ledgerError } = result.stats
+  const { rawChars, outputChars, matched, previousOutput, cut, ledgerThrough, ledgerError, hiddenChars, mediaSaved } = result.stats
   const notes = [
+    hiddenChars ? `${k(hiddenChars)} of it images/thinking` : '',
+    mediaSaved ? `${mediaSaved} images archived` : '',
     matched < previousOutput ? `only ${matched}/${previousOutput} of the last output was recognised; the rest was archived as new` : '',
     ledgerThrough < cut ? `ledger lags the cut by ${cut - ledgerThrough} messages` : '',
     ledgerError ? `ledger not updated: ${ledgerError}` : ''
   ].filter(Boolean)
-  $.ui.log(`strata: ${k(rawChars)} branch -> ${k(outputChars)} live${notes.length ? ` (${notes.join('; ')})` : ''}`)
+  $.ui.log(`${k(rawChars)} branch text -> ${k(outputChars)} live${notes.length ? ` (${notes.join('; ')})` : ''}`)
   // A ready-mode compaction can leave the ledger behind the cut: catch it up
   // now, planning on exactly this output so nothing else has to run first.
   if (ledgerThrough < cut && (await thresholds($)).auto) prepareInBackground($, session, messages.map(plain))
@@ -132,7 +164,7 @@ export const register: Register = on => {
     return strataCompact($, e, next, await $.session.id())
   }).catch(($, e, next) => {
     // Any failure (timeout, bad JSON) falls back to the engine's own compaction.
-    $.ui.log('strata: compaction hook failed, using the built-in compactor')
+    $.ui.log('compaction hook failed, using the built-in compactor')
     return next(e)
   })
 

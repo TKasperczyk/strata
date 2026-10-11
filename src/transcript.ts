@@ -1,5 +1,6 @@
 import { readFileSync } from 'fs'
 import type { Message, ToolUse } from './types.js'
+import type { ApiBlock, ApiMessage } from './weights.js'
 
 type Block = { type: string; text?: string; id?: string; name?: string; input?: unknown; tool_use_id?: string; content?: unknown; is_error?: boolean }
 type Row = {
@@ -27,7 +28,16 @@ function resultText(content: unknown): string {
  * summaries are skipped so replay sees what really happened.
  */
 export function readTranscript(path: string): Message[] {
+  return readTranscriptWithBlocks(path).messages
+}
+
+/**
+ * The same rows plus each one's raw content blocks (images, thinking and all),
+ * so replay can hand strata the Messages API form the plugin would.
+ */
+export function readTranscriptWithBlocks(path: string): { messages: Message[]; blocks: Map<Message, ApiBlock[]> } {
   const messages: Message[] = []
+  const blockMap = new Map<Message, ApiBlock[]>()
   const toolUses = new Map<string, ToolUse>()
   for (const line of readFileSync(path, 'utf-8').split('\n')) {
     if (!line.trim()) continue
@@ -45,6 +55,7 @@ export function readTranscript(path: string): Message[] {
     if (row.type === 'assistant') {
       const target: Message = { role: 'assistant', text: '', toolUses: [] }
       messages.push(target)
+      blockMap.set(target, blocks as ApiBlock[])
       for (const b of blocks) {
         if (b.type === 'text' && b.text) target.text = target.text ? `${target.text}\n${b.text}` : b.text
         if (b.type === 'tool_use' && b.id) {
@@ -67,8 +78,26 @@ export function readTranscript(path: string): Message[] {
         if (r.isError) use.isError = true
       }
     }
-    if (!text && results.length === 0) continue
-    messages.push({ role: 'user', text, toolUses: [], ...(results.length ? { toolResults: results } : {}) })
+    const hasMedia = blocks.some(b => b.type === 'image' || b.type === 'document')
+    if (!text && results.length === 0 && !hasMedia) continue
+    const message: Message = { role: 'user', text, toolUses: [], ...(results.length ? { toolResults: results } : {}) }
+    messages.push(message)
+    blockMap.set(message, blocks as ApiBlock[])
   }
-  return messages
+  return { messages, blocks: blockMap }
+}
+
+/**
+ * The Messages API form of `live`: consecutive same-role rows merged into one
+ * message, as the engine regroups them. Rows strata built have text blocks only.
+ */
+export function apiForm(live: Message[], blocks: Map<Message, ApiBlock[]>): ApiMessage[] {
+  const api: ApiMessage[] = []
+  for (const m of live) {
+    const own = blocks.get(m) ?? [{ type: 'text', text: m.text }]
+    const last = api.at(-1)
+    if (last && last.role === m.role) last.content.push(...own)
+    else api.push({ role: m.role, content: [...own] })
+  }
+  return api
 }
