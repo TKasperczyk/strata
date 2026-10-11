@@ -17,7 +17,24 @@ The rebuilt context has these layers, oldest first:
 | Masked middle | 24% | User and assistant text verbatim. Tool calls kept with shortened arguments. Large tool results replaced by `[strata elided … archive seq N]`. Tool calls are never dropped, which avoids the fabricated-work failure seen in fast-jev-compaction #65. |
 | Verbatim tail | rest | The newest units, passed through as the engine's own messages (thinking, images and response grouping intact). |
 
-The model can recover anything with `node dist/cli.js show <session> <seq> [<last>]`, or by reading the archive file. The header tells it how.
+The model can recover anything with the `show` command the header names (`node <plugin>/bin/strata.mjs show <session> <seq> [<last>]`), or by reading the archive file.
+
+## Install
+
+Needs Claude Code 2.1.294 or later (function hooks) and `node` 20+ on the PATH. Nothing to clone or build: the CLI ships inside the plugin as one bundled file.
+
+In Claude Code, run:
+
+```
+/plugin install strata --marketplace TKasperczyk/strata
+/plugin install strata-trigger --marketplace TKasperczyk/strata
+```
+
+Answer `y` to add the marketplace, then pick the user scope. Both plugins are then active in every session. `strata` replaces compaction, and `strata-trigger` makes it compact on its own past 400k tokens. Install only `strata` if you want strata to handle `/compact` (and auto-compaction, if you have it on) but never start a compaction itself.
+
+From a shell, the same is `claude plugin marketplace add TKasperczyk/strata`, then `claude plugin install strata@strata` and `claude plugin install strata-trigger@strata`. Update later with `claude plugin marketplace update strata` followed by `claude plugin update strata@strata` and `claude plugin update strata-trigger@strata`.
+
+Tune it with environment variables (see Settings below), e.g. in the `env` block of `~/.claude/settings.json`.
 
 ## Self-trigger and background ledger
 
@@ -33,15 +50,15 @@ Each compaction rewrites the start of the conversation, so the next request miss
 ## Layout
 
 - `src/`: the CLI and core logic. Model calls use the same SDK client and auth as [claude-memory](https://github.com/TKasperczyk/claude-memory) (`src/anthropic.ts`, copied over): `ANTHROPIC_API_KEY`, then `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL`, then `~/.claude/.credentials.json`.
-- `plugin/`: a Claude Code function-hook plugin. It answers `session.compact` by piping the transcript to `dist/cli.js compact --in - --out -`.
+- `plugin/`: a Claude Code function-hook plugin. It answers `session.compact` by piping the transcript to its bundled CLI, `plugin/bin/strata.mjs compact --in - --out -`.
   - If anything fails (non-zero exit, timeout, bad output), it falls back to the built-in compactor.
   - Precompute dispatches are skipped.
   - Subagent compactions use the built-in compactor.
 
-## Use
+## Development
 
 ```bash
-pnpm install && pnpm build
+pnpm install && pnpm build        # tsc, then re-bundles plugin/bin/strata.mjs (commit it)
 pnpm test                       # core invariants
 claude plugin test plugin          # compaction hook and background ledger
 claude plugin test plugin-trigger  # self-trigger
@@ -49,8 +66,8 @@ claude plugin test plugin-trigger  # self-trigger
 # Offline: replay a real transcript and watch the live context across compactions
 node dist/cli.js replay ~/.claude/projects/<proj>/<session>.jsonl --budget 30000 --trigger 60000 [--no-llm] [--keep] [--background]
 
-# Live: load both plugins for one session (strata answers compactions, strata-trigger starts them)
-claude --plugin-dir ~/Programming/strata/plugin --plugin-dir ~/Programming/strata/plugin-trigger
+# Live from a working copy: load both plugins for one session
+claude --plugin-dir ./plugin --plugin-dir ./plugin-trigger
 ```
 
 ## Settings (env)
