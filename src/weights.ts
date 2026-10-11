@@ -113,22 +113,36 @@ export function hiddenByRow(input: Message[], api: ApiMessage[]): Map<number, Hi
     return undefined
   }
 
+  const assistantRowWithText = (text: string) => findForward(m => m.role === 'assistant' && m.text.trim() === text)
+  const promptRowWithText = (text: string) => findForward(m => m.role === 'user' && !m.toolResults?.length && m.text.trim() === text)
+
   for (const message of api) {
     if (message.role === 'assistant') {
-      const thinking = message.content.reduce((n, b) => n + thinkingChars(b), 0)
-      const firstCall = message.content.find(b => b.type === 'tool_use')
-      const firstText = message.content.find(b => b.type === 'text' && String(b.text ?? '').trim())
-      let anchor = firstCall ? callRow.get(String(firstCall.id)) : undefined
-      if (anchor === undefined && firstText) {
-        const text = String(firstText.text).trim()
-        anchor = findForward(m => m.role === 'assistant' && m.text.trim() === text)
+      // The engine regroups one streamed response's blocks across its own tool
+      // results, so one message can span several exchanges. Each thinking block
+      // belongs to the call or text that follows it, not to the message's first.
+      let pending = 0
+      let last: number | undefined
+      for (const block of message.content) {
+        pending += thinkingChars(block)
+        let row: number | undefined
+        if (block.type === 'tool_use') row = callRow.get(String(block.id))
+        else if (block.type === 'text' && String(block.text ?? '').trim()) row = assistantRowWithText(String(block.text).trim())
+        if (row === undefined) continue
+        cursor = Math.max(cursor, row)
+        last = row
+        if (pending) at(row).thinkingChars += pending
+        pending = 0
       }
-      anchor ??= findForward(m => m.role === 'assistant')
-      if (anchor === undefined) continue
-      cursor = anchor
-      if (thinking) at(anchor).thinkingChars += thinking
+      // Thinking with nothing after it (an answer still to come) stays with the response.
+      if (pending) {
+        const row = last ?? findForward(m => m.role === 'assistant')
+        if (row !== undefined) at(row).thinkingChars += pending
+      }
       continue
     }
+    // Consecutive prompts merge into one message: each image belongs to the
+    // prompt whose text came just before it, or else the next image-only row.
     let promptAnchor: number | undefined
     for (const block of message.content) {
       if (block.type === 'tool_result') {
@@ -143,9 +157,13 @@ export function hiddenByRow(input: Message[], api: ApiMessage[]): Map<number, Hi
           at(row).images.push(ref)
           at(row).imageTokens += imageTokens(ref.data)
         }
-      } else if (block.type === 'text' && promptAnchor === undefined) {
+      } else if (block.type === 'text') {
         const text = String(block.text ?? '').trim()
-        if (text) promptAnchor = findForward(m => m.role === 'user' && !m.toolResults?.length && m.text.trim() === text)
+        const row = text ? promptRowWithText(text) : undefined
+        if (row !== undefined) {
+          promptAnchor = row
+          cursor = row
+        }
       } else if (block.type === 'image') {
         const ref = imageRef(block)
         if (!ref) continue
@@ -154,22 +172,38 @@ export function hiddenByRow(input: Message[], api: ApiMessage[]): Map<number, Hi
         cursor = row
         at(row).images.push(ref)
         at(row).imageTokens += imageTokens(ref.data)
+        // An image-only row takes one image; the next goes to the next such row.
+        if (promptAnchor === undefined) cursor = row + 1
       }
     }
-    if (promptAnchor !== undefined) cursor = promptAnchor
   }
   return hidden
 }
 
 /**
- * Thinking chars per token for this session: the real window minus overhead
- * minus what strata can see is thinking. Falls back to the default when the
- * reading is missing or makes no sense.
+ * Where the last request's input ended: before the final assistant response,
+ * whose output (thinking included) the engine's token reading does not cover,
+ * along with anything after it.
+ */
+export function lastRequestEnd(input: Message[]): number {
+  let end = input.length
+  while (end > 0 && input[end - 1].role !== 'assistant') end--
+  while (end > 0 && input[end - 1].role === 'assistant') end--
+  return end
+}
+
+/**
+ * Thinking chars per token for this session: of the last request's input, the
+ * real size minus overhead minus what strata can see is thinking. Only rows
+ * that request carried count, so the newest response's thinking cannot skew
+ * it. Falls back to the default when the reading is missing or makes no sense.
  */
 export function thinkingRatio(input: Message[], hidden: Map<number, Hidden>, usage: UsageReading | undefined): number {
-  const thinking = [...hidden.values()].reduce((n, h) => n + h.thinkingChars, 0)
+  const end = lastRequestEnd(input)
+  const seen = [...hidden.entries()].filter(([row]) => row < end).map(([, h]) => h)
+  const thinking = seen.reduce((n, h) => n + h.thinkingChars, 0)
   if (!thinking || usage?.tokens === undefined || usage.overhead === undefined) return DEFAULT_THINKING_CHARS_PER_TOKEN
-  const visible = input.reduce((n, m) => n + messageChars(m), 0) / CHARS_PER_TOKEN + [...hidden.values()].reduce((n, h) => n + h.imageTokens, 0)
+  const visible = input.slice(0, end).reduce((n, m) => n + messageChars(m), 0) / CHARS_PER_TOKEN + seen.reduce((n, h) => n + h.imageTokens, 0)
   const thinkingTokens = usage.tokens - usage.overhead - visible
   if (thinkingTokens <= 0) return DEFAULT_THINKING_CHARS_PER_TOKEN
   return Math.min(RATIO_BOUNDS[1], Math.max(RATIO_BOUNDS[0], thinking / thinkingTokens))

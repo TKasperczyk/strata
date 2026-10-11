@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { compact, OversizeError } from '../src/compact.js'
 import { loadConfig, type Config } from '../src/config.js'
 import type { Message, OutputEntry } from '../src/types.js'
-import { DEFAULT_THINKING_CHARS_PER_TOKEN, hiddenByRow, imageDimensions, imageTokens, thinkingRatio, type ApiMessage } from '../src/weights.js'
+import { DEFAULT_THINKING_CHARS_PER_TOKEN, hiddenByRow, imageDimensions, imageTokens, lastRequestEnd, thinkingRatio, type ApiMessage } from '../src/weights.js'
 
 const SESSION = 'weights'
 const SHOW = 'strata show weights'
@@ -87,12 +87,63 @@ describe('hiddenByRow', () => {
   })
 })
 
+describe('third-pass regressions (weights)', () => {
+  it('charges each thinking block of a regrouped response to the call it precedes', () => {
+    const rows = [user('go'), thinkingRow(), call('a'), result('a'), thinkingRow(), call('b'), result('b')]
+    // The engine regroups one streamed response across its own results.
+    const api: ApiMessage[] = [
+      { role: 'user', content: [{ type: 'text', text: 'go' }] },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: '', signature: 'A'.repeat(100) },
+          { type: 'tool_use', id: 'a', name: 'Read', input: {} },
+          { type: 'thinking', thinking: '', signature: 'B'.repeat(40_000) },
+          { type: 'tool_use', id: 'b', name: 'Read', input: {} }
+        ]
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a', content: 'ok' }, { type: 'tool_result', tool_use_id: 'b', content: 'ok' }] }
+    ]
+    const hidden = hiddenByRow(rows, api)
+    expect(hidden.get(2)?.thinkingChars).toBe(100)
+    expect(hidden.get(5)?.thinkingChars).toBe(40_000)
+  })
+
+  it('gives each image of merged prompts to the prompt it follows', () => {
+    const rows = [user('first picture'), user('second picture'), answer('two pictures')]
+    const api: ApiMessage[] = [
+      { role: 'user', content: [{ type: 'text', text: 'first picture' }, image(png(100, 100)), { type: 'text', text: 'second picture' }, image(png(2000, 1500))] },
+      { role: 'assistant', content: [{ type: 'text', text: 'two pictures' }] }
+    ]
+    const hidden = hiddenByRow(rows, api)
+    expect(hidden.get(0)?.imageTokens).toBe(imageTokens(png(100, 100)))
+    expect(hidden.get(1)?.imageTokens).toBe(imageTokens(png(2000, 1500)))
+  })
+
+  it('leaves the newest response out of calibration: the reading predates it', () => {
+    const { rows, api } = turns(2)
+    const fresh: Message[] = [user('think hard'), thinkingRow(), answer('done')]
+    const freshApi: ApiMessage[] = [
+      { role: 'user', content: [{ type: 'text', text: 'think hard' }] },
+      { role: 'assistant', content: [{ type: 'thinking', thinking: '', signature: 'z'.repeat(40_000) }, { type: 'text', text: 'done' }] }
+    ]
+    const all = [...rows, ...fresh]
+    expect(lastRequestEnd(all)).toBe(all.length - 2)
+    const hidden = hiddenByRow(all, [...api, ...freshApi])
+    const withoutFresh = hiddenByRow(rows, api)
+    const reading = { tokens: 20_000, overhead: 1_000 }
+    // The fresh response's 40k signature chars must not move the ratio.
+    expect(thinkingRatio(all, hidden, reading)).toBeCloseTo(thinkingRatio([...rows, user('think hard')], withoutFresh, reading), 1)
+  })
+})
+
 describe('thinkingRatio', () => {
   it('calibrates against the real window and falls back without a reading', () => {
     const { rows, api } = turns(3)
     const hidden = hiddenByRow(rows, api)
     expect(thinkingRatio(rows, hidden, undefined)).toBe(DEFAULT_THINKING_CHARS_PER_TOKEN)
-    const visible = rows.reduce((n, m) => n + m.text.length + m.toolUses.reduce((k, u) => k + u.tool.length + JSON.stringify(u.input).length, 0) + (m.toolResults ?? []).reduce((k, r) => k + r.text.length, 0), 0) / 3.5
+    // The last request did not carry the final answer: calibration leaves it out.
+    const visible = rows.slice(0, lastRequestEnd(rows)).reduce((n, m) => n + m.text.length + m.toolUses.reduce((k, u) => k + u.tool.length + JSON.stringify(u.input).length, 0) + (m.toolResults ?? []).reduce((k, r) => k + r.text.length, 0), 0) / 3.5
     const images = [...hidden.values()].reduce((n, h) => n + h.imageTokens, 0)
     // 3 signatures of 4,000 chars standing for 2,400 tokens: 5 chars per token.
     const ratio = thinkingRatio(rows, hidden, { tokens: Math.round(1_000 + visible + images + 2_400), overhead: 1_000 })

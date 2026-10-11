@@ -6783,20 +6783,27 @@ function hiddenByRow(input, api) {
     for (let i = cursor; i < input.length; i++) if (test(input[i])) return i;
     return void 0;
   };
+  const assistantRowWithText = (text) => findForward((m) => m.role === "assistant" && m.text.trim() === text);
+  const promptRowWithText = (text) => findForward((m) => m.role === "user" && !m.toolResults?.length && m.text.trim() === text);
   for (const message of api) {
     if (message.role === "assistant") {
-      const thinking = message.content.reduce((n, b) => n + thinkingChars(b), 0);
-      const firstCall = message.content.find((b) => b.type === "tool_use");
-      const firstText = message.content.find((b) => b.type === "text" && String(b.text ?? "").trim());
-      let anchor = firstCall ? callRow.get(String(firstCall.id)) : void 0;
-      if (anchor === void 0 && firstText) {
-        const text = String(firstText.text).trim();
-        anchor = findForward((m) => m.role === "assistant" && m.text.trim() === text);
+      let pending = 0;
+      let last;
+      for (const block of message.content) {
+        pending += thinkingChars(block);
+        let row;
+        if (block.type === "tool_use") row = callRow.get(String(block.id));
+        else if (block.type === "text" && String(block.text ?? "").trim()) row = assistantRowWithText(String(block.text).trim());
+        if (row === void 0) continue;
+        cursor = Math.max(cursor, row);
+        last = row;
+        if (pending) at(row).thinkingChars += pending;
+        pending = 0;
       }
-      anchor ??= findForward((m) => m.role === "assistant");
-      if (anchor === void 0) continue;
-      cursor = anchor;
-      if (thinking) at(anchor).thinkingChars += thinking;
+      if (pending) {
+        const row = last ?? findForward((m) => m.role === "assistant");
+        if (row !== void 0) at(row).thinkingChars += pending;
+      }
       continue;
     }
     let promptAnchor;
@@ -6813,9 +6820,13 @@ function hiddenByRow(input, api) {
           at(row).images.push(ref);
           at(row).imageTokens += imageTokens(ref.data);
         }
-      } else if (block.type === "text" && promptAnchor === void 0) {
+      } else if (block.type === "text") {
         const text = String(block.text ?? "").trim();
-        if (text) promptAnchor = findForward((m) => m.role === "user" && !m.toolResults?.length && m.text.trim() === text);
+        const row = text ? promptRowWithText(text) : void 0;
+        if (row !== void 0) {
+          promptAnchor = row;
+          cursor = row;
+        }
       } else if (block.type === "image") {
         const ref = imageRef(block);
         if (!ref) continue;
@@ -6824,16 +6835,24 @@ function hiddenByRow(input, api) {
         cursor = row;
         at(row).images.push(ref);
         at(row).imageTokens += imageTokens(ref.data);
+        if (promptAnchor === void 0) cursor = row + 1;
       }
     }
-    if (promptAnchor !== void 0) cursor = promptAnchor;
   }
   return hidden;
 }
+function lastRequestEnd(input) {
+  let end = input.length;
+  while (end > 0 && input[end - 1].role !== "assistant") end--;
+  while (end > 0 && input[end - 1].role === "assistant") end--;
+  return end;
+}
 function thinkingRatio(input, hidden, usage) {
-  const thinking = [...hidden.values()].reduce((n, h) => n + h.thinkingChars, 0);
+  const end = lastRequestEnd(input);
+  const seen = [...hidden.entries()].filter(([row]) => row < end).map(([, h]) => h);
+  const thinking = seen.reduce((n, h) => n + h.thinkingChars, 0);
   if (!thinking || usage?.tokens === void 0 || usage.overhead === void 0) return DEFAULT_THINKING_CHARS_PER_TOKEN;
-  const visible = input.reduce((n, m) => n + messageChars(m), 0) / CHARS_PER_TOKEN + [...hidden.values()].reduce((n, h) => n + h.imageTokens, 0);
+  const visible = input.slice(0, end).reduce((n, m) => n + messageChars(m), 0) / CHARS_PER_TOKEN + seen.reduce((n, h) => n + h.imageTokens, 0);
   const thinkingTokens = usage.tokens - usage.overhead - visible;
   if (thinkingTokens <= 0) return DEFAULT_THINKING_CHARS_PER_TOKEN;
   return Math.min(RATIO_BOUNDS[1], Math.max(RATIO_BOUNDS[0], thinking / thinkingTokens));
