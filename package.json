@@ -1,0 +1,22 @@
+{
+  "name": "strata",
+  "version": "0.1.0",
+  "description": "Layered, budget-bounded compaction for Claude Code: archive everything, rebuild context from the raw history every time",
+  "type": "module",
+  "bin": { "strata": "./dist/cli.js" },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "replay": "tsx src/cli.ts replay"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.90.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.0.16"
+  }
+}

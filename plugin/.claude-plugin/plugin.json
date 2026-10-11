@@ -1,0 +1,5 @@
+{
+  "name": "strata",
+  "version": "0.1.0",
+  "description": "Replaces Claude Code's summary compaction with strata's archive-backed, budget-bounded layered context"
+}

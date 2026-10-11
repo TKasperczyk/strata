@@ -1,0 +1,5 @@
+{
+  "name": "strata-trigger",
+  "version": "0.1.0",
+  "description": "Starts a strata compaction between turns once the context passes STRATA_TRIGGER_TOKENS"
+}

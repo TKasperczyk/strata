@@ -1,0 +1,4 @@
+node_modules
+dist
+plugin/.claude-plugin/types
+plugin-trigger/.claude-plugin/types
