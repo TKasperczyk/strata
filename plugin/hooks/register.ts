@@ -7,9 +7,9 @@ import type { EngineInterface, Next, Register, SessionCompactInput, SessionCompa
 const CLI_TIMEOUT_MS = 5 * 60 * 1000
 /** A background ledger job may take several model calls; the host caps a run at ten minutes. */
 const PREPARE_TIMEOUT_MS = 10 * 60 * 1000
-const DEFAULT_TRIGGER_TOKENS = 400_000
-/** Start preparing the ledger this far below the trigger, so it is ready in time. */
-const PREPARE_FRACTION = 0.75
+const DEFAULT_TRIGGER_TOKENS = 900_000
+/** Start preparing the ledger this far below the trigger (never below half of it), so it is ready in time. */
+const PREPARE_HEADROOM_TOKENS = 100_000
 // chars / 3.5 tokens per char / 1000, for "123k" in log lines
 const CHARS_PER_KTOKEN = 3500
 
@@ -151,7 +151,7 @@ export async function thresholds($: EngineInterface): Promise<Thresholds> {
   return {
     auto: (await $.env.get('STRATA_AUTO')) !== '0',
     trigger,
-    prepare: positiveInt(await $.env.get('STRATA_PREPARE_TOKENS')) ?? Math.round(trigger * PREPARE_FRACTION)
+    prepare: positiveInt(await $.env.get('STRATA_PREPARE_TOKENS')) ?? Math.max(Math.round(trigger / 2), trigger - PREPARE_HEADROOM_TOKENS)
   }
 }
 

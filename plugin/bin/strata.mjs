@@ -87,7 +87,7 @@ function envInt(name, fallback, min = 1) {
 }
 var PREPARE_MIN_SHARE = 0.05;
 function loadConfig(overrides = {}) {
-  const budgetTokens = overrides.budgetTokens ?? envInt("STRATA_BUDGET_TOKENS", 1e5);
+  const budgetTokens = overrides.budgetTokens ?? envInt("STRATA_BUDGET_TOKENS", 2e5);
   return {
     dataDir: process.env.STRATA_DATA_DIR ?? join2(homedir(), ".strata"),
     budgetTokens,
@@ -7296,7 +7296,7 @@ async function runReplay(argv) {
       trigger: { type: "string" },
       "no-llm": { type: "boolean" },
       keep: { type: "boolean" },
-      // Emulate the plugin: prepare the ledger at 3/4 of the trigger, compact instantly at the trigger.
+      // Emulate the plugin: prepare the ledger 100k below the trigger (at least half of it), compact instantly at the trigger.
       background: { type: "boolean" }
     }
   });
@@ -7321,7 +7321,8 @@ async function runReplay(argv) {
   process.stdout.write(`${raw.length} messages, ${tokens(raw).toLocaleString("en-US")} est. tokens raw; budget ${config.budgetTokens}, trigger ${trigger}
 `);
   const ledgerFn = values["no-llm"] ? noLedger : void 0;
-  const prepareAt = Math.round(trigger * 0.75);
+  const PREPARE_HEADROOM_TOKENS = 1e5;
+  const prepareAt = Math.max(Math.round(trigger / 2), trigger - PREPARE_HEADROOM_TOKENS);
   let live = [];
   let compactions = 0;
   let preparedThisCycle = false;

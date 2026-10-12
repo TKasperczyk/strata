@@ -30,7 +30,7 @@ In Claude Code, run:
 /plugin install strata-trigger --marketplace TKasperczyk/strata
 ```
 
-Answer `y` to add the marketplace, then pick the user scope. Both plugins are then active in every session. `strata` replaces compaction, and `strata-trigger` makes it compact on its own past 400k tokens. Install only `strata` if you want strata to handle `/compact` (and auto-compaction, if you have it on) but never start a compaction itself.
+Answer `y` to add the marketplace, then pick the user scope. Both plugins are then active in every session. `strata` replaces compaction, and `strata-trigger` makes it compact on its own past 900k tokens. Install only `strata` if you want strata to handle `/compact` (and auto-compaction, if you have it on) but never start a compaction itself.
 
 From a shell, the same is `claude plugin marketplace add TKasperczyk/strata`, then `claude plugin install strata@strata` and `claude plugin install strata-trigger@strata`. Update later with `claude plugin marketplace update strata` followed by `claude plugin update strata@strata` and `claude plugin update strata-trigger@strata`.
 
@@ -50,8 +50,8 @@ Without the API form (an older engine, or an error reading it) strata falls back
 
 strata compacts on its own, so it works with `autoCompactEnabled: false`. That takes two plugins, because a plugin's own `$.session.compact()` skips every hook of that plugin: `strata-trigger` (`plugin-trigger/`) starts the compaction, and `strata` (`plugin/`) answers it. Load both. After every main-loop turn they read the context size (`$.session.usage()`, which is free) and then:
 
-- **Past `STRATA_PREPARE_TOKENS`** (default 3/4 of the trigger), it starts `strata prepare` in the background. That job folds everything the next compaction would evict into a ready ledger (`ready-ledger.json`). You keep working while it runs. It writes only that file, never the archive or state. The file is tied to the exact history it covers, so a rewind or replacement invalidates it. Only one job runs per session.
-- **Past `STRATA_TRIGGER_TOKENS`** (default 400000), `strata-trigger` compacts between turns, and `strata` answers with `--ledger ready`: deterministic assembly plus the newest ready ledger, with no model call, so it takes about 1-2 s. A ledger that lags the cut says so in the header, and the gap is still covered by the episode index and the archive. Right afterwards, `strata` catches the ledger up in the background, planning on exactly the output it just produced.
+- **Past `STRATA_PREPARE_TOKENS`** (default 100k below the trigger, never below half of it: 800000), it starts `strata prepare` in the background. That job folds everything the next compaction would evict into a ready ledger (`ready-ledger.json`). You keep working while it runs. It writes only that file, never the archive or state. The file is tied to the exact history it covers, so a rewind or replacement invalidates it. Only one job runs per session.
+- **Past `STRATA_TRIGGER_TOKENS`** (default 900000), `strata-trigger` compacts between turns, and `strata` answers with `--ledger ready`: deterministic assembly plus the newest ready ledger, with no model call, so it takes about 1-2 s. A ledger that lags the cut says so in the header, and the gap is still covered by the episode index and the archive. Right afterwards, `strata` catches the ledger up in the background, planning on exactly the output it just produced.
 
 A manual `/compact` still brings the ledger fully up to date first, so it waits on the model. Set `STRATA_AUTO=0` to turn off the self-trigger.
 
@@ -84,11 +84,11 @@ claude --plugin-dir ./plugin --plugin-dir ./plugin-trigger
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `STRATA_BUDGET_TOKENS` | `100000` | Size of the rebuilt messages, in tokens: text (chars / 3.5) plus the images and thinking of the rows kept verbatim. Set Claude Code's trigger well above it, e.g. `CLAUDE_CODE_AUTO_COMPACT_WINDOW`. |
+| `STRATA_BUDGET_TOKENS` | `200000` | Size of the rebuilt messages, in tokens: text (chars / 3.5) plus the images and thinking of the rows kept verbatim. Set Claude Code's trigger well above it, e.g. `CLAUDE_CODE_AUTO_COMPACT_WINDOW`. |
 | `STRATA_LEDGER_MODEL` | `claude-sonnet-5-5` | Model that writes the ledger. |
 | `STRATA_LEDGER_REBUILD_EVERY` | `5` | Rebuild the ledger from the whole archive every N compactions (0 = never). Skipped for an incremental update once a rebuild would take more than 3 model requests, so long sessions don't pay a cost that keeps growing. |
-| `STRATA_TRIGGER_TOKENS` | `400000` | Plugin: compact on its own once the context passes this. |
-| `STRATA_PREPARE_TOKENS` | 3/4 of trigger | Plugin: start preparing the ledger in the background past this. |
+| `STRATA_TRIGGER_TOKENS` | `900000` | Plugin: compact on its own once the context passes this. |
+| `STRATA_PREPARE_TOKENS` | trigger - 100000 (min. half) | Plugin: start preparing the ledger in the background past this. |
 | `STRATA_AUTO` | on | Plugin: `0` turns off the self-trigger and background preparation. |
 | `STRATA_DATA_DIR` | `~/.strata` | Where archives and per-session state live. |
 

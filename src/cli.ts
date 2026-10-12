@@ -127,7 +127,7 @@ async function runReplay(argv: string[]): Promise<void> {
       trigger: { type: 'string' },
       'no-llm': { type: 'boolean' },
       keep: { type: 'boolean' },
-      // Emulate the plugin: prepare the ledger at 3/4 of the trigger, compact instantly at the trigger.
+      // Emulate the plugin: prepare the ledger 100k below the trigger (at least half of it), compact instantly at the trigger.
       background: { type: 'boolean' }
     }
   })
@@ -155,7 +155,8 @@ async function runReplay(argv: string[]): Promise<void> {
 
   process.stdout.write(`${raw.length} messages, ${tokens(raw).toLocaleString('en-US')} est. tokens raw; budget ${config.budgetTokens}, trigger ${trigger}\n`)
   const ledgerFn = values['no-llm'] ? noLedger : undefined
-  const prepareAt = Math.round(trigger * 0.75)
+  const PREPARE_HEADROOM_TOKENS = 100_000
+  const prepareAt = Math.max(Math.round(trigger / 2), trigger - PREPARE_HEADROOM_TOKENS)
   let live: Message[] = []
   let compactions = 0
   let preparedThisCycle = false

@@ -1,6 +1,6 @@
 {
   "name": "strata",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Replaces Claude Code's summary compaction with strata's archive-backed, budget-bounded layered context",
   "author": {
     "name": "Tomasz Kasperczyk"

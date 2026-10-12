@@ -40,7 +40,7 @@ function envInt(name: string, fallback: number, min = 1): number {
 const PREPARE_MIN_SHARE = 0.05
 
 export function loadConfig(overrides: Partial<Config> = {}): Config {
-  const budgetTokens = overrides.budgetTokens ?? envInt('STRATA_BUDGET_TOKENS', 100_000)
+  const budgetTokens = overrides.budgetTokens ?? envInt('STRATA_BUDGET_TOKENS', 200_000)
   return {
     dataDir: process.env.STRATA_DATA_DIR ?? join(homedir(), '.strata'),
     budgetTokens,

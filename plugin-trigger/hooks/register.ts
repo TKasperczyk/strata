@@ -3,7 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 // A plugin's own $.session.compact() runs every hook but that plugin's, so the
 // plugin that answers compactions (strata) cannot also start them: this one does.
 // Its thresholds mirror strata's (STRATA_TRIGGER_TOKENS, STRATA_AUTO).
-const DEFAULT_TRIGGER_TOKENS = 400_000
+const DEFAULT_TRIGGER_TOKENS = 900_000
 /** A compaction that has not settled by now is presumed lost, so triggering can resume. */
 const STUCK_AFTER_MS = 10 * 60 * 1000
 const STATUS_COMMAND = 'strata-status'
