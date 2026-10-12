@@ -21,7 +21,7 @@ The model can recover anything with the `show` command the header names (`node <
 
 ## Install
 
-Needs Claude Code 2.1.294 or later (function hooks) and `node` 20+ on the PATH. Nothing to clone or build: the CLI ships inside the plugin as one bundled file.
+Needs Claude Code with function hooks and `node` 20+ on the PATH. From 2.1.294 they are on by default. Earlier releases (tested on 2.1.284) keep them behind an early-access flag, so add `"CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1"` to the `env` block of `~/.claude/settings.json`, or the plugins install but never run. Nothing to clone or build: the CLI ships inside the plugin as one bundled file.
 
 In Claude Code, run:
 
