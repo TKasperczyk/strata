@@ -3,25 +3,36 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { basename, join, resolve } from 'path'
 import { parseArgs } from 'util'
-import { readArchive, sessionDir } from './archive.js'
-import { compact, DeclineError, prepare, type CompactStats, type LedgerFn } from './compact.js'
-import { estimateTokens, loadConfig } from './config.js'
-import { messageChars, renderMessage } from './mask.js'
+import { sessionDir } from './archive.js'
+import { compact, DeclineError, planLedger, prepare, type CompactStats, type LedgerFn, type PreparedLedger } from './compact.js'
+import { estimateTokens, loadConfig, shareChars } from './config.js'
+import { trimLedger } from './ledger.js'
+import { messageChars } from './mask.js'
+import { formatSessionStatus, searchArchive, sessionStatus, showArchive } from './query.js'
+import { readReady, writeReady } from './ready.js'
 import { apiForm, readTranscriptWithBlocks } from './transcript.js'
 import { DEFAULT_THINKING_CHARS_PER_TOKEN, hiddenByRow, type ApiMessage, type UsageReading } from './weights.js'
 import type { Message } from './types.js'
 
 const USAGE = `strata - layered, budget-bounded compaction for Claude Code
 
-  strata compact --session <key> --in <messages.json|-> --out <result.json|-> [--instructions <text>] [--budget <tokens>] [--ledger sync|ready]
-  strata prepare --session <key> --in <messages.json|-> [--budget <tokens>]
-  strata show <session-key> <seq> [<last-seq>]
+  strata compact --session <key> --in <messages.json|-> --out <result.json|-> [--instructions <text>] [--budget <tokens>] [--ledger sync|ready] [--native-tools]
+  strata prepare --session <key> (--in <messages.json|-> | --through <cut>) [--instructions <text>] [--budget <tokens>]
+  strata ledger-plan --session <key> (--in <messages.json|-> | --through <cut>) [--instructions <text>] [--budget <tokens>] [--sync]
+  strata ledger-save --session <key> --in <ready.json|-> [--budget <tokens>]
+  strata show <session-key> <seq> [<last-seq>] [--offset <chars>] [--limit <chars>]
+  strata search <session-key> <query> [--all-branches] [--role user|assistant] [--errors] [--regex] [--max <n>] [--from <seq>] [--to <seq>]
+  strata status <session-key> [--json]
   strata replay <transcript.jsonl> [--budget <tokens>] [--trigger <tokens>] [--no-llm] [--keep] [--background]
 
 Data lives in $STRATA_DATA_DIR (default ~/.strata).`
 
+function shellQuote(value: string): string {
+  return /^[A-Za-z0-9_./:@-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`
+}
+
 const SELF = resolve(process.argv[1])
-const SHOW_COMMAND = (key: string) => `node ${SELF} show ${key}`
+const SHOW_COMMAND = (key: string) => `node ${shellQuote(SELF)} show ${shellQuote(key)}`
 
 /** Offline stand-in for the ledger model: records how far it got, so lag is visible. */
 const noLedger: LedgerFn = async (previous, span) => ({ ledger: `${previous}\n- folded through #${span.at(-1)?.seq}`.trim(), requests: 1 })
@@ -31,11 +42,20 @@ function fail(message: string): never {
   process.exit(2)
 }
 
-function budgetOverride(raw: string | undefined): { budgetTokens?: number } {
-  if (raw === undefined) return {}
+function parseIntArg(name: string, raw: string | undefined, min: number): number | undefined {
+  if (raw === undefined) return undefined
   const n = Number.parseInt(raw, 10)
-  if (!(n > 0)) fail(`--budget must be a positive integer, got ${raw}`)
-  return { budgetTokens: n }
+  if (!Number.isFinite(n) || n < min) fail(`${name} must be an integer >= ${min}, got ${raw}`)
+  return n
+}
+
+function budgetOverride(raw: string | undefined): { budgetTokens?: number } {
+  const n = parseIntArg('--budget', raw, 1)
+  return n !== undefined ? { budgetTokens: n } : {}
+}
+
+function readJsonInput<T>(source: string): T {
+  return JSON.parse(readFileSync(source === '-' ? 0 : source, 'utf-8')) as T
 }
 
 async function runCompact(argv: string[]): Promise<void> {
@@ -47,26 +67,32 @@ async function runCompact(argv: string[]): Promise<void> {
       out: { type: 'string' },
       instructions: { type: 'string' },
       budget: { type: 'string' },
-      ledger: { type: 'string' }
+      ledger: { type: 'string' },
+      'native-tools': { type: 'boolean' }
     }
   })
   if (!values.session || !values.in || !values.out) fail('compact needs --session, --in and --out')
   if (values.ledger !== undefined && values.ledger !== 'sync' && values.ledger !== 'ready') fail(`--ledger must be sync or ready, got ${values.ledger}`)
   const config = loadConfig(budgetOverride(values.budget))
   // `-` reads stdin / writes stdout, which is how the plugin calls it.
-  const { messages, api, usage } = JSON.parse(readFileSync(values.in === '-' ? 0 : values.in, 'utf-8')) as {
+  const payload = readJsonInput<{
     messages: Message[]
     api?: ApiMessage[]
     usage?: UsageReading
-  }
+    preparedLedger?: PreparedLedger
+    ledgerError?: string
+  }>(values.in)
   const result = await compact(
     {
       sessionKey: values.session,
-      messages,
+      messages: payload.messages,
       ...(values.instructions ? { instructions: values.instructions } : {}),
       ...(values.ledger ? { ledgerMode: values.ledger } : {}),
-      ...(api ? { api } : {}),
-      ...(usage ? { usage } : {}),
+      ...(values['native-tools'] ? { hasNativeTools: true } : {}),
+      ...(payload.api ? { api: payload.api } : {}),
+      ...(payload.usage ? { usage: payload.usage } : {}),
+      ...(payload.preparedLedger ? { preparedLedger: payload.preparedLedger } : {}),
+      ...(payload.ledgerError ? { ledgerError: payload.ledgerError } : {}),
       showCommand: SHOW_COMMAND(values.session)
     },
     config
@@ -78,22 +104,182 @@ async function runCompact(argv: string[]): Promise<void> {
 
 /** Background ledger preparation; prints one JSON line, never touches archive or state. */
 async function runPrepare(argv: string[]): Promise<void> {
-  const { values } = parseArgs({ args: argv, options: { session: { type: 'string' }, in: { type: 'string' }, budget: { type: 'string' } } })
-  if (!values.session || !values.in) fail('prepare needs --session and --in')
-  const { messages } = JSON.parse(readFileSync(values.in === '-' ? 0 : values.in, 'utf-8')) as { messages: Message[] }
-  const result = await prepare({ sessionKey: values.session, messages, showCommand: SHOW_COMMAND(values.session) }, loadConfig(budgetOverride(values.budget)))
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      session: { type: 'string' },
+      in: { type: 'string' },
+      through: { type: 'string' },
+      instructions: { type: 'string' },
+      budget: { type: 'string' }
+    }
+  })
+  if (!values.session || (!values.in && values.through === undefined)) fail('prepare needs --session and either --in or --through')
+  const config = loadConfig(budgetOverride(values.budget))
+  if (values.through !== undefined) {
+    const through = parseIntArg('--through', values.through, 0)!
+    const result = await prepare(
+      { sessionKey: values.session, through, ...(values.instructions ? { instructions: values.instructions } : {}) },
+      config
+    )
+    process.stdout.write(`${JSON.stringify(result)}\n`)
+    return
+  }
+  const { messages, api, usage } = readJsonInput<{ messages: Message[]; api?: ApiMessage[]; usage?: UsageReading }>(values.in!)
+  const result = await prepare(
+    {
+      sessionKey: values.session,
+      messages,
+      ...(api ? { api } : {}),
+      ...(usage ? { usage } : {}),
+      ...(values.instructions ? { instructions: values.instructions } : {}),
+      showCommand: SHOW_COMMAND(values.session)
+    },
+    config
+  )
   process.stdout.write(`${JSON.stringify(result)}\n`)
 }
 
+/** Read-only ledger update plan for the host plugin's `$.model.complete` loop. */
+function runLedgerPlan(argv: string[]): void {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      session: { type: 'string' },
+      in: { type: 'string' },
+      through: { type: 'string' },
+      instructions: { type: 'string' },
+      budget: { type: 'string' },
+      sync: { type: 'boolean' }
+    }
+  })
+  if (!values.session || (!values.in && values.through === undefined)) fail('ledger-plan needs --session and either --in or --through')
+  const config = loadConfig(budgetOverride(values.budget))
+  const options = values.sync ? { enforceMinChars: false } : {}
+  if (values.through !== undefined) {
+    const through = parseIntArg('--through', values.through, 0)!
+    const plan = planLedger(
+      { sessionKey: values.session, through, ...(values.instructions ? { instructions: values.instructions } : {}) },
+      config,
+      options
+    )
+    process.stdout.write(`${JSON.stringify(plan)}\n`)
+    return
+  }
+  const { messages, api, usage } = readJsonInput<{ messages: Message[]; api?: ApiMessage[]; usage?: UsageReading }>(values.in!)
+  const plan = planLedger(
+    {
+      sessionKey: values.session,
+      messages,
+      ...(api ? { api } : {}),
+      ...(usage ? { usage } : {}),
+      ...(values.instructions ? { instructions: values.instructions } : {}),
+      showCommand: SHOW_COMMAND(values.session)
+    },
+    config,
+    options
+  )
+  process.stdout.write(`${JSON.stringify(plan)}\n`)
+}
+
+/** Save a ready ledger computed by the host plugin via `$.model.complete`. */
+function runLedgerSave(argv: string[]): void {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      session: { type: 'string' },
+      in: { type: 'string' },
+      budget: { type: 'string' }
+    }
+  })
+  if (!values.session || !values.in) fail('ledger-save needs --session and --in')
+  const config = loadConfig(budgetOverride(values.budget))
+  const dir = sessionDir(config.dataDir, values.session)
+  const payload = readJsonInput<{ ledger: string; through: number; prefixHash: string; age: number }>(values.in)
+  if (typeof payload.ledger !== 'string' || typeof payload.through !== 'number' || typeof payload.prefixHash !== 'string' || typeof payload.age !== 'number') {
+    fail('ledger-save input must contain ledger, through, prefixHash and age')
+  }
+  const existing = readReady(dir)
+  if (existing && existing.prefixHash === payload.prefixHash && existing.through >= payload.through) {
+    process.stdout.write(`${JSON.stringify({ saved: false, reason: 'already saved for this prefix', through: existing.through })}\n`)
+    return
+  }
+  writeReady(dir, {
+    ledger: trimLedger(payload.ledger, shareChars(config, 'ledger')),
+    through: payload.through,
+    prefixHash: payload.prefixHash,
+    age: payload.age,
+    preparedAt: new Date().toISOString()
+  })
+  process.stdout.write(`${JSON.stringify({ saved: true, through: payload.through })}\n`)
+}
+
 function runShow(argv: string[]): void {
-  const [key, first, last] = argv
-  if (!key || first === undefined) fail('show needs <session-key> <seq>')
-  const from = Number.parseInt(first, 10)
-  const to = last === undefined ? from : Number.parseInt(last, 10)
-  const archive = readArchive(sessionDir(loadConfig().dataDir, key))
-  const picked = archive.filter(m => m.seq >= from && m.seq <= to)
-  if (picked.length === 0) fail(`no archived messages in seq ${from}-${to} (archive holds ${archive.length})`)
-  process.stdout.write(picked.map(m => renderMessage(m, m.seq)).join('\n\n') + '\n')
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: {
+      offset: { type: 'string' },
+      limit: { type: 'string' }
+    }
+  })
+  const [key, first, last] = positionals
+  if (!key || first === undefined) fail('show needs <session-key> <seq> [<last-seq>]')
+  const from = parseIntArg('<seq>', first, 0)!
+  const to = last === undefined ? from : parseIntArg('<last-seq>', last, from)!
+  const offset = parseIntArg('--offset', values.offset, 0)
+  const limit = parseIntArg('--limit', values.limit, 1)
+  const result = showArchive(sessionDir(loadConfig().dataDir, key), { from, to, offset, limit })
+  if (!result.found) fail(`no archived messages in seq ${from}-${to} (archive holds ${result.archiveCount})`)
+  process.stdout.write(`${result.text}\n`)
+}
+
+function runSearch(argv: string[]): void {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: {
+      'all-branches': { type: 'boolean' },
+      role: { type: 'string' },
+      errors: { type: 'boolean' },
+      regex: { type: 'boolean' },
+      max: { type: 'string' },
+      from: { type: 'string' },
+      to: { type: 'string' }
+    }
+  })
+  const [key, ...queryParts] = positionals
+  const query = queryParts.join(' ')
+  if (!key || !query) fail('search needs <session-key> <query>')
+  if (values.role !== undefined && values.role !== 'user' && values.role !== 'assistant') {
+    fail(`--role must be user or assistant, got ${values.role}`)
+  }
+  const result = searchArchive(sessionDir(loadConfig().dataDir, key), {
+    query,
+    branchOnly: !values['all-branches'],
+    ...(values.role ? { role: values.role } : {}),
+    ...(values.errors ? { errorsOnly: true } : {}),
+    ...(values.regex ? { regex: true } : {}),
+    maxMatches: parseIntArg('--max', values.max, 1),
+    fromSeq: parseIntArg('--from', values.from, 0),
+    toSeq: parseIntArg('--to', values.to, 0)
+  })
+  process.stdout.write(`${result.formatted}\n`)
+}
+
+function runStatus(argv: string[]): void {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: {
+      json: { type: 'boolean' }
+    }
+  })
+  const [key] = positionals
+  if (!key) fail('status needs <session-key>')
+  const status = sessionStatus(sessionDir(loadConfig().dataDir, key), key)
+  if (values.json) process.stdout.write(`${JSON.stringify(status)}\n`)
+  else process.stdout.write(`${formatSessionStatus(status)}\n`)
 }
 
 function summarize(s: CompactStats): string {
@@ -135,7 +321,7 @@ async function runReplay(argv: string[]): Promise<void> {
   if (!path) fail('replay needs a transcript path')
   const dataDir = mkdtempSync(join(tmpdir(), 'strata-replay-'))
   const config = loadConfig({ dataDir, ...budgetOverride(values.budget) })
-  const trigger = values.trigger ? Number.parseInt(values.trigger, 10) : config.budgetTokens * 2
+  const trigger = values.trigger ? parseIntArg('--trigger', values.trigger, 1)! : config.budgetTokens * 2
   const key = `replay-${basename(path, '.jsonl')}`
   const { messages: raw, blocks } = readTranscriptWithBlocks(path)
   // Live size as the engine would count it: text plus the images and thinking the rows hide,
@@ -152,7 +338,6 @@ async function runReplay(argv: string[]): Promise<void> {
   }
   const tokens = (ms: Message[]) => ms.reduce((n, m) => n + tokensOf(m), 0)
 
-
   process.stdout.write(`${raw.length} messages, ${tokens(raw).toLocaleString('en-US')} est. tokens raw; budget ${config.budgetTokens}, trigger ${trigger}\n`)
   const ledgerFn = values['no-llm'] ? noLedger : undefined
   const PREPARE_HEADROOM_TOKENS = 100_000
@@ -165,7 +350,11 @@ async function runReplay(argv: string[]): Promise<void> {
     const size = tokens(live)
     if (values.background && size >= prepareAt && size < trigger && !preparedThisCycle) {
       preparedThisCycle = true
-      const prepared = await prepare({ sessionKey: key, messages: live, showCommand: SHOW_COMMAND(key) }, config, ledgerFn)
+      const prepared = await prepare(
+        { sessionKey: key, messages: live, api: apiForm(live, blocks), showCommand: SHOW_COMMAND(key) },
+        config,
+        ledgerFn
+      )
       process.stdout.write(`   prepare at ${Math.round(size / 1000)}k: ${JSON.stringify(prepared)}\n`)
     }
     if (size < trigger) continue
@@ -186,9 +375,9 @@ async function runReplay(argv: string[]): Promise<void> {
     live = result.entries.map(e => ('keep' in e ? live[e.keep] : e.built))
     compactions++
     process.stdout.write(`#${compactions} ${summarize(result.stats)}\n`)
-    // As the plugin does: a ready compaction that left the ledger behind catches it up from its own output.
+    // As the plugin does: a ready compaction that left the ledger behind catches it up through the committed cut.
     if (values.background && result.stats.ledgerThrough < result.stats.cut) {
-      const caught = await prepare({ sessionKey: key, messages: live, showCommand: SHOW_COMMAND(key) }, config, ledgerFn)
+      const caught = await prepare({ sessionKey: key, through: result.stats.cut }, config, ledgerFn)
       process.stdout.write(`   catch-up: ${JSON.stringify(caught)}\n`)
     }
   }
@@ -198,7 +387,16 @@ async function runReplay(argv: string[]): Promise<void> {
 }
 
 const [command, ...rest] = process.argv.slice(2)
-const commands: Record<string, (argv: string[]) => unknown> = { compact: runCompact, prepare: runPrepare, show: runShow, replay: runReplay }
+const commands: Record<string, (argv: string[]) => unknown> = {
+  compact: runCompact,
+  prepare: runPrepare,
+  'ledger-plan': runLedgerPlan,
+  'ledger-save': runLedgerSave,
+  show: runShow,
+  search: runSearch,
+  status: runStatus,
+  replay: runReplay
+}
 const run = command ? commands[command] : undefined
 if (!run) fail(command ? `unknown command: ${command}` : 'no command given')
 // Exit 3 means strata declined (too big, or thinking it cannot keep): the plugin

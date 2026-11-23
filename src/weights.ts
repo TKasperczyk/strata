@@ -28,20 +28,31 @@ export type Hidden = {
   images: ImageRef[]
 }
 
+export type Calibration = {
+  /** Calibrated thinking signature chars per token. */
+  thinkingRatio: number
+  /** Calibrated visible-text chars per token. */
+  charsPerToken: number
+}
+
 /** Thinking chars per token when nothing can be calibrated; measured 2.8-5.0 on real sessions. */
 export const DEFAULT_THINKING_CHARS_PER_TOKEN = 4
 const RATIO_BOUNDS = [1.5, 8] as const
+const TEXT_RATIO_BOUNDS = [2.0, 5.0] as const
 /** Tokens per image when its dimensions cannot be read. */
 const UNKNOWN_IMAGE_TOKENS = 1_600
-/** Anthropic's image cost: about width x height / 750 tokens. */
+/** Anthropic's image cost: about width x height / 750 tokens, after downscaling. */
 const PIXELS_PER_TOKEN = 750
+/** Anthropic downscales images past 1568px on the long edge or ~1.15-1.20 MP (~1,600 tokens). */
+const MAX_IMAGE_LONG_EDGE = 1_568
+const MAX_IMAGE_TOKENS = 1_600
 
 /** Pixel dimensions from a base64 PNG, JPEG, GIF or WebP header, if readable. */
 export function imageDimensions(base64: string): [number, number] | undefined {
   const head = Buffer.from(base64.slice(0, 120_000), 'base64')
-  if (head.length > 24 && head.readUInt32BE(0) === 0x89504e47) return [head.readUInt32BE(16), head.readUInt32BE(20)]
-  if (head.length > 10 && head.toString('ascii', 0, 3) === 'GIF') return [head.readUInt16LE(6), head.readUInt16LE(8)]
-  if (head.length > 30 && head.toString('ascii', 0, 4) === 'RIFF' && head.toString('ascii', 8, 12) === 'WEBP') {
+  if (head.length >= 24 && head.readUInt32BE(0) === 0x89504e47) return [head.readUInt32BE(16), head.readUInt32BE(20)]
+  if (head.length >= 10 && head.toString('ascii', 0, 3) === 'GIF') return [head.readUInt16LE(6), head.readUInt16LE(8)]
+  if (head.length >= 30 && head.toString('ascii', 0, 4) === 'RIFF' && head.toString('ascii', 8, 12) === 'WEBP') {
     const kind = head.toString('ascii', 12, 16)
     if (kind === 'VP8X') return [1 + head.readUIntLE(24, 3), 1 + head.readUIntLE(27, 3)]
     if (kind === 'VP8 ') return [head.readUInt16LE(26) & 0x3fff, head.readUInt16LE(28) & 0x3fff]
@@ -50,16 +61,30 @@ export function imageDimensions(base64: string): [number, number] | undefined {
       return [1 + (bits & 0x3fff), 1 + ((bits >> 14) & 0x3fff)]
     }
   }
-  if (head.length > 4 && head[0] === 0xff && head[1] === 0xd8) {
+  if (head.length >= 4 && head[0] === 0xff && head[1] === 0xd8) {
     let i = 2
-    while (i + 9 < head.length) {
+    while (i < head.length) {
       if (head[i] !== 0xff) {
         i++
         continue
       }
-      const marker = head[i + 1]
-      if (marker >= 0xc0 && marker <= 0xc3) return [head.readUInt16BE(i + 7), head.readUInt16BE(i + 5)]
-      i += 2 + head.readUInt16BE(i + 2)
+      // JPEG permits arbitrary 0xFF fill bytes before a marker byte.
+      while (i < head.length && head[i] === 0xff) i++
+      if (i >= head.length) break
+      const marker = head[i++]
+      // Standalone markers (byte-stuffed 0x00, TEM 0x01, RST0-7 0xD0-0xD7, SOI 0xD8) have no length field.
+      if (marker === 0x00 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd8)) continue
+      // EOI (0xD9) or Start of Scan (0xDA): SOF must precede image data.
+      if (marker === 0xd9 || marker === 0xda) break
+      if (i + 2 > head.length) break
+      const len = head.readUInt16BE(i)
+      if (len < 2) break
+      const isSof = marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc
+      if (isSof) {
+        if (i + 7 > head.length) break
+        return [head.readUInt16BE(i + 5), head.readUInt16BE(i + 3)]
+      }
+      i += len
     }
   }
   return undefined
@@ -67,7 +92,11 @@ export function imageDimensions(base64: string): [number, number] | undefined {
 
 export function imageTokens(base64: string): number {
   const size = imageDimensions(base64)
-  return size ? Math.ceil((size[0] * size[1]) / PIXELS_PER_TOKEN) : UNKNOWN_IMAGE_TOKENS
+  if (!size || size[0] <= 0 || size[1] <= 0) return UNKNOWN_IMAGE_TOKENS
+  const [w, h] = size
+  const edgeScale = Math.min(1, MAX_IMAGE_LONG_EDGE / Math.max(w, h))
+  const scaledPixels = w * edgeScale * (h * edgeScale)
+  return Math.min(MAX_IMAGE_TOKENS, Math.ceil(scaledPixels / PIXELS_PER_TOKEN))
 }
 
 function imageRef(block: ApiBlock, toolUseId?: string): ImageRef | undefined {
@@ -87,11 +116,39 @@ function emptyHidden(): Hidden {
 }
 
 /**
+ * Match an API text block against a SessionMessage's `text`. Multiple text
+ * blocks on one row are joined with `\n` in SessionMessage.text, so a block
+ * matches either the whole trimmed text or a line-bounded segment within it.
+ */
+function hasTextBlock(rowText: string, blockText: string): boolean {
+  const trimmed = rowText.trim()
+  if (trimmed === blockText) return true
+  if (!trimmed.includes('\n')) return false
+  let idx = trimmed.indexOf(blockText)
+  while (idx !== -1) {
+    let start = idx
+    while (start > 0 && trimmed[start - 1] !== '\n' && (trimmed[start - 1] === ' ' || trimmed[start - 1] === '\t' || trimmed[start - 1] === '\r')) start--
+    const startOk = start === 0 || trimmed[start - 1] === '\n'
+    let end = idx + blockText.length
+    while (end < trimmed.length && trimmed[end] !== '\n' && (trimmed[end] === ' ' || trimmed[end] === '\t' || trimmed[end] === '\r')) end++
+    const endOk = end === trimmed.length || trimmed[end] === '\n'
+    if (startOk && endOk) return true
+    idx = trimmed.indexOf(blockText, idx + 1)
+  }
+  return false
+}
+
+function isEmptyPrompt(m: Message): boolean {
+  return m.role === 'user' && !m.toolResults?.length && !m.text.trim()
+}
+
+/**
  * Attach each API message's images and thinking to the input rows they belong
  * to. Tool results and their images match by tool_use_id; a response's
  * thinking goes to the row of its first call or text; a pasted image goes to
- * its prompt's row, or the next image-only row. Placement only has to be right
- * to the exchange: strata moves whole exchanges, never single rows.
+ * its prompt's row (whether it precedes or follows the prompt's text), or else
+ * the image-only prompt row(s). Placement only has to be right to the exchange:
+ * strata moves whole exchanges, never single rows.
  */
 export function hiddenByRow(input: Message[], api: ApiMessage[]): Map<number, Hidden> {
   const hidden = new Map<number, Hidden>()
@@ -99,6 +156,11 @@ export function hiddenByRow(input: Message[], api: ApiMessage[]): Map<number, Hi
     let h = hidden.get(row)
     if (!h) hidden.set(row, (h = emptyHidden()))
     return h
+  }
+  const attachImage = (row: number, ref: ImageRef) => {
+    const h = at(row)
+    h.images.push(ref)
+    h.imageTokens += imageTokens(ref.data)
   }
   const callRow = new Map<string, number>()
   const resultRow = new Map<string, number>()
@@ -108,13 +170,13 @@ export function hiddenByRow(input: Message[], api: ApiMessage[]): Map<number, Hi
   })
   // Rows are in conversation order; searching forward from the last match keeps repeats apart.
   let cursor = 0
-  const findForward = (test: (m: Message) => boolean): number | undefined => {
-    for (let i = cursor; i < input.length; i++) if (test(input[i])) return i
+  const findForward = (test: (m: Message) => boolean, from = cursor): number | undefined => {
+    for (let i = from; i < input.length; i++) if (test(input[i])) return i
     return undefined
   }
 
-  const assistantRowWithText = (text: string) => findForward(m => m.role === 'assistant' && m.text.trim() === text)
-  const promptRowWithText = (text: string) => findForward(m => m.role === 'user' && !m.toolResults?.length && m.text.trim() === text)
+  const assistantRowWithText = (text: string) => findForward(m => m.role === 'assistant' && hasTextBlock(m.text, text))
+  const promptRowWithText = (text: string) => findForward(m => m.role === 'user' && !m.toolResults?.length && hasTextBlock(m.text, text))
 
   for (const message of api) {
     if (message.role === 'assistant') {
@@ -126,10 +188,16 @@ export function hiddenByRow(input: Message[], api: ApiMessage[]): Map<number, Hi
       for (const block of message.content) {
         pending += thinkingChars(block)
         let row: number | undefined
-        if (block.type === 'tool_use') row = callRow.get(String(block.id))
-        else if (block.type === 'text' && String(block.text ?? '').trim()) row = assistantRowWithText(String(block.text).trim())
+        let advancePast = false
+        if (block.type === 'tool_use') {
+          row = callRow.get(String(block.id))
+        } else if (block.type === 'text' && String(block.text ?? '').trim()) {
+          const text = String(block.text).trim()
+          row = assistantRowWithText(text)
+          if (row !== undefined && input[row].text.trim() === text) advancePast = true
+        }
         if (row === undefined) continue
-        cursor = Math.max(cursor, row)
+        cursor = Math.max(cursor, advancePast ? row + 1 : row)
         last = row
         if (pending) at(row).thinkingChars += pending
         pending = 0
@@ -141,9 +209,14 @@ export function hiddenByRow(input: Message[], api: ApiMessage[]): Map<number, Hi
       }
       continue
     }
-    // Consecutive prompts merge into one message: each image belongs to the
-    // prompt whose text came just before it, or else the next image-only row.
+
+    // Consecutive prompts merge into one message. Images may either follow their
+    // prompt's text ([text, image]) or precede it ([image, text]), or appear
+    // alone on image-only user rows ([image]). Buffer leading images until a text
+    // block reveals whether empty-text prompt rows preceded it or the images
+    // belong to that prompt itself.
     let promptAnchor: number | undefined
+    const pendingImages: ImageRef[] = []
     for (const block of message.content) {
       if (block.type === 'tool_result') {
         const id = String(block.tool_use_id)
@@ -153,27 +226,42 @@ export function hiddenByRow(input: Message[], api: ApiMessage[]): Map<number, Hi
         const content = Array.isArray(block.content) ? (block.content as ApiBlock[]) : []
         for (const inner of content) {
           const ref = imageRef(inner, id)
-          if (!ref) continue
-          at(row).images.push(ref)
-          at(row).imageTokens += imageTokens(ref.data)
+          if (ref) attachImage(row, ref)
         }
       } else if (block.type === 'text') {
         const text = String(block.text ?? '').trim()
         const row = text ? promptRowWithText(text) : undefined
         if (row !== undefined) {
+          if (pendingImages.length) {
+            const emptyBefore: number[] = []
+            for (let k = row - 1; k >= cursor && isEmptyPrompt(input[k]); k--) emptyBefore.unshift(k)
+            if (emptyBefore.length) {
+              pendingImages.forEach((ref, idx) => attachImage(emptyBefore[Math.min(idx, emptyBefore.length - 1)], ref))
+            } else {
+              for (const ref of pendingImages) attachImage(row, ref)
+            }
+            pendingImages.length = 0
+          }
           promptAnchor = row
-          cursor = row
+          const exact = input[row].text.trim() === text
+          cursor = Math.max(cursor, exact ? row + 1 : row)
         }
       } else if (block.type === 'image') {
         const ref = imageRef(block)
         if (!ref) continue
-        const row = promptAnchor ?? findForward(m => m.role === 'user' && !m.toolResults?.length && !m.text.trim())
-        if (row === undefined) continue
-        cursor = row
-        at(row).images.push(ref)
-        at(row).imageTokens += imageTokens(ref.data)
-        // An image-only row takes one image; the next goes to the next such row.
-        if (promptAnchor === undefined) cursor = row + 1
+        if (promptAnchor !== undefined) attachImage(promptAnchor, ref)
+        else pendingImages.push(ref)
+      }
+    }
+    if (pendingImages.length) {
+      const firstEmpty = findForward(isEmptyPrompt)
+      if (firstEmpty !== undefined) {
+        const emptyRows: number[] = []
+        for (let k = firstEmpty; k < input.length && isEmptyPrompt(input[k]) && emptyRows.length < pendingImages.length; k++) {
+          emptyRows.push(k)
+        }
+        pendingImages.forEach((ref, idx) => attachImage(emptyRows[Math.min(idx, emptyRows.length - 1)], ref))
+        cursor = Math.max(cursor, emptyRows[emptyRows.length - 1] + 1)
       }
     }
   }
@@ -193,24 +281,79 @@ export function lastRequestEnd(input: Message[]): number {
 }
 
 /**
- * Thinking chars per token for this session: of the last request's input, the
- * real size minus overhead minus what strata can see is thinking. Only rows
- * that request carried count, so the newest response's thinking cannot skew
- * it. Falls back to the default when the reading is missing or makes no sense.
+ * Jointly calibrate thinking chars/token and visible-text chars/token against
+ * the last request's real token reading, partitioning any residual by prior
+ * variance so neither small thinking shares nor missing thinking distort the
+ * estimate, and the residual is never double-counted.
  */
-export function thinkingRatio(input: Message[], hidden: Map<number, Hidden>, usage: UsageReading | undefined): number {
+export function calibrateWeights(input: Message[], hidden: Map<number, Hidden>, usage: UsageReading | undefined): Calibration {
+  const fallback: Calibration = { thinkingRatio: DEFAULT_THINKING_CHARS_PER_TOKEN, charsPerToken: CHARS_PER_TOKEN }
+  if (usage?.tokens === undefined || usage.overhead === undefined) return fallback
   const end = lastRequestEnd(input)
   const seen = [...hidden.entries()].filter(([row]) => row < end).map(([, h]) => h)
   const thinking = seen.reduce((n, h) => n + h.thinkingChars, 0)
-  if (!thinking || usage?.tokens === undefined || usage.overhead === undefined) return DEFAULT_THINKING_CHARS_PER_TOKEN
-  const visible = input.slice(0, end).reduce((n, m) => n + messageChars(m), 0) / CHARS_PER_TOKEN + seen.reduce((n, h) => n + h.imageTokens, 0)
-  const thinkingTokens = usage.tokens - usage.overhead - visible
-  if (thinkingTokens <= 0) return DEFAULT_THINKING_CHARS_PER_TOKEN
-  return Math.min(RATIO_BOUNDS[1], Math.max(RATIO_BOUNDS[0], thinking / thinkingTokens))
+  const images = seen.reduce((n, h) => n + h.imageTokens, 0)
+  const textChars = input.slice(0, end).reduce((n, m) => n + messageChars(m), 0)
+  const actualNonImage = usage.tokens - usage.overhead - images
+  if (actualNonImage <= 0) return fallback
+
+  const textEst = textChars / CHARS_PER_TOKEN
+  const thinkingEst = thinking / DEFAULT_THINKING_CHARS_PER_TOKEN
+  const residual = actualNonImage - (textEst + thinkingEst)
+
+  // Prior uncertainty: text heuristic (~15%), encrypted thinking ratio (~40%),
+  // plus image/framing floor so tiny contexts shrink gently toward defaults.
+  const sigmaText = textChars >= 1_000 ? 0.15 * textEst : 0
+  const sigmaThink = thinking > 0 ? 0.4 * thinkingEst : 0
+  const sigmaFloor = 0.02 * images + 100
+  const vText = sigmaText * sigmaText
+  const vThink = sigmaThink * sigmaThink
+  const vTotal = vText + vThink + sigmaFloor * sigmaFloor
+
+  let calibratedThinking = DEFAULT_THINKING_CHARS_PER_TOKEN
+  if (thinking > 0) {
+    const thinkingTokens = thinkingEst + residual * (vThink / vTotal)
+    if (thinkingTokens > 0) {
+      calibratedThinking = Math.min(RATIO_BOUNDS[1], Math.max(RATIO_BOUNDS[0], thinking / thinkingTokens))
+    }
+  }
+
+  let calibratedText = CHARS_PER_TOKEN
+  if (textChars >= 1_000) {
+    const textTokens = textEst + residual * (vText / vTotal)
+    if (textTokens > 0) {
+      calibratedText = Math.min(TEXT_RATIO_BOUNDS[1], Math.max(TEXT_RATIO_BOUNDS[0], textChars / textTokens))
+    }
+  }
+
+  return { thinkingRatio: calibratedThinking, charsPerToken: calibratedText }
+}
+
+/**
+ * Thinking chars per token for this session, calibrated against the last
+ * request's real token reading. Falls back to the default when the reading is
+ * missing, makes no sense, or thinking is too small a share of context.
+ */
+export function thinkingRatio(input: Message[], hidden: Map<number, Hidden>, usage: UsageReading | undefined): number {
+  return calibrateWeights(input, hidden, usage).thinkingRatio
+}
+
+/** Visible-text chars per token for this session, calibrated against the last request. */
+export function textCharsPerToken(input: Message[], hidden: Map<number, Hidden>, usage: UsageReading | undefined): number {
+  return calibrateWeights(input, hidden, usage).charsPerToken
 }
 
 /** A row's hidden weight in the char units strata budgets in. */
 export function hiddenChars(h: Hidden | undefined, ratio: number): number {
   if (!h) return 0
   return Math.round((h.imageTokens + h.thinkingChars / ratio) * CHARS_PER_TOKEN)
+}
+
+/**
+ * Extra (or saved) char-budget weight for a row's visible text when real text
+ * density differs from CHARS_PER_TOKEN.
+ */
+export function calibratedTextChars(rawChars: number, charsPerToken: number): number {
+  if (charsPerToken === CHARS_PER_TOKEN) return rawChars
+  return Math.round(rawChars * (CHARS_PER_TOKEN / charsPerToken))
 }

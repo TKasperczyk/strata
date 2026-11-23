@@ -1,14 +1,16 @@
-import { mkdtempSync, readFileSync, rmSync } from 'fs'
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { compact, HEADER_MARK, OversizeError, prepare, UnpreservableError, type LedgerFn } from '../src/compact.js'
+import { readArchive, readState } from '../src/archive.js'
+import { compact, HEADER_MARK, mediaExtension, OversizeError, planLedger, prepare, UnpreservableError, type LedgerFn } from '../src/compact.js'
 import { readReady, tryLock } from '../src/ready.js'
 import { loadConfig, type Config } from '../src/config.js'
 import { renderEpisode, renderIndex, segmentEpisodes } from '../src/episodes.js'
-import { messageChars, STUB_PREFIX } from '../src/mask.js'
+import { maskMessage, messageChars, STUB_PREFIX } from '../src/mask.js'
 import type { Message, OutputEntry } from '../src/types.js'
 import { segmentUnits } from '../src/units.js'
+import type { ApiMessage } from '../src/weights.js'
 
 const SESSION = 'test-session'
 const SHOW = 'strata show test-session'
@@ -447,5 +449,218 @@ describe('renderIndex', () => {
     expect(index.length).toBeLessThanOrEqual(full.length / 4)
     expect(index).toContain('[seq 0-')
     expect(index).toContain(`-${archived.length - 1}]`)
+  })
+
+  it('protects newest evicted episodes and rows past ledgerThrough before older episodes', () => {
+    const archived = Array.from({ length: 40 }, (_, n) => turn(n)).flat().map((m, seq) => ({ ...m, seq }))
+    const episodes = segmentEpisodes(archived)
+    const full = episodes.map(renderEpisode).join('\n')
+    const protectAfterSeq = episodes[34].first
+    const index = renderIndex(episodes, Math.floor(full.length * 0.45), { protectAfterSeq })
+    // Every episode from 34 onward (the lagging gap) must remain unmerged at single-episode resolution.
+    for (let k = 34; k < 40; k++) {
+      expect(index).toContain(`[seq ${episodes[k].first}-${episodes[k].last}]`)
+    }
+    // Older episodes absorbed the coarsening instead.
+    expect(index).toContain('prompts, e.g.')
+  })
+
+  it('captures compact Bash command and error hints in episode summaries', () => {
+    const msgs: Message[] = [
+      user('run the test suite'),
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'b1', tool: 'Bash', input: { command: 'pnpm test --filter auth\necho done' } }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'b1', text: 'running tests...\nFAIL src/auth.test.ts\nTypeError: token is undefined', isError: true }] },
+      answer('investigating failure')
+    ]
+    const episodes = segmentEpisodes(msgs.map((m, seq) => ({ ...m, seq })))
+    const rendered = renderEpisode(episodes[0])
+    expect(rendered).toContain('cmds: `pnpm test --filter auth`')
+    expect(rendered).toContain('errors: 1 (TypeError: token is undefined)')
+  })
+})
+
+describe('v0.3 improvements and edge cases', () => {
+  it('lets unused header and tail slack flow to verbatim tail and masked middle', async () => {
+    // Realistic budget (50k tokens = 175k chars) with short original prompt and compact turns:
+    // old hard caps left ~15-25% unused; slack flow should achieve >85% utilization.
+    config = loadConfig({ dataDir: dir, budgetTokens: 20_000, ledgerRebuildEvery: 0 })
+    const budget = 20_000 * 3.5
+    const live = Array.from({ length: 60 }, (_, n) => turn(n)).flat()
+    const { stats } = await compact({ sessionKey: SESSION, messages: live, showCommand: SHOW, ledgerMode: 'ready' }, config, fakeLedger)
+    expect(stats.outputChars).toBeLessThanOrEqual(budget)
+    expect(stats.outputChars).toBeGreaterThan(budget * 0.85)
+  })
+
+  it('maskMessage keeps head+tail excerpts, caps huge assistant replies, and omits mirrored toolUses text', () => {
+    const hugeNormal = `HEAD_MARKER_${'a'.repeat(5_000)}_TAIL_MARKER`
+    const hugeError = `ERR_TOP_${'e'.repeat(5_000)}_ERR_BOTTOM_CODE_42`
+    const userRes: Message = {
+      role: 'user',
+      text: 'ok',
+      toolUses: [],
+      toolResults: [
+        { tool_use_id: 'u1', text: hugeNormal, isError: false },
+        { tool_use_id: 'u2', text: hugeError, isError: true }
+      ]
+    }
+    const maskedRes = maskMessage(userRes, 42, config)
+    expect(maskedRes.toolResults?.[0].text.startsWith(STUB_PREFIX)).toBe(true)
+    expect(maskedRes.toolResults?.[0].text).toContain('archive seq 42')
+    expect(maskedRes.toolResults?.[0].text).toContain('HEAD_MARKER_')
+    expect(maskedRes.toolResults?.[0].text).toContain('_TAIL_MARKER')
+    expect(maskedRes.toolResults?.[1].text.startsWith(STUB_PREFIX)).toBe(true)
+    expect(maskedRes.toolResults?.[1].text).toContain('ERR_TOP_')
+    expect(maskedRes.toolResults?.[1].text).toContain('_ERR_BOTTOM_CODE_42')
+
+    const hugeAssistant: Message = {
+      role: 'assistant',
+      text: `START_PROSE_${'p'.repeat(10_000)}_END_CONCLUSION`,
+      toolUses: [{ tool_use_id: 'u1', tool: 'Read', input: { file_path: '/a.ts' }, text: hugeNormal, isError: true }]
+    }
+    const maskedAsst = maskMessage(hugeAssistant, 41, config)
+    expect(maskedAsst.text.length).toBeLessThan(5_000)
+    expect(maskedAsst.text).toContain('START_PROSE_')
+    expect(maskedAsst.text).toContain('_END_CONCLUSION')
+    expect(maskedAsst.text).toContain('archive seq 41')
+    // Mirrored text/isError must be omitted on built ToolUse so assistant seq is never stamped onto result text.
+    expect(maskedAsst.toolUses[0].text).toBeUndefined()
+    expect(maskedAsst.toolUses[0].isError).toBeUndefined()
+  })
+
+  it('honours /compact <instructions> even when the ledger already covers cutRow', async () => {
+    const live = Array.from({ length: 12 }, (_, n) => turn(n)).flat()
+    // First compact catches ledger up to cutRow.
+    const first = await run(live)
+    const out = materialize(live, first.entries)
+    let seenFocus: string | undefined
+    let called = 0
+    const refocusLedger: LedgerFn = async (prev, _span, _cfg, focus) => {
+      called++
+      seenFocus = focus
+      return { ledger: `${prev}\n- refocused: ${focus}`.trim(), requests: 1 }
+    }
+    // Second compact on the exact same output (cutRow <= ledgerThrough) with instructions!
+    const second = await compact(
+      { sessionKey: SESSION, messages: out, instructions: 'preserve auth migration details', showCommand: SHOW },
+      config,
+      refocusLedger
+    )
+    expect(called).toBe(1)
+    expect(seenFocus).toBe('preserve auth migration details')
+    expect(materialize(out, second.entries)[0].text).toContain('refocused: preserve auth migration details')
+  })
+
+  it('tolerates normalization across multiple built messages when the verbatim kept tail matches', async () => {
+    config = loadConfig({ dataDir: dir, budgetTokens: BUDGET_TOKENS * 2, ledgerRebuildEvery: 0 })
+    let live = Array.from({ length: 18 }, (_, n) => turn(n)).flat()
+    const first = await run(live)
+    live = materialize(live, first.entries)
+    const builtIndices = first.entries.map((e, i) => ('built' in e ? i : -1)).filter(i => i > 0)
+    expect(builtIndices.length).toBeGreaterThanOrEqual(3)
+    // Normalize 3 separate built messages while keeping the verbatim tail untouched.
+    for (const idx of builtIndices.slice(0, 3)) {
+      live[idx] = { ...live[idx], text: `${live[idx].text} [normalized]` }
+    }
+    live.push(...turn(99))
+    const second = await run(live)
+    expect(second.stats.matchedPrevious).toBe(true)
+    expect(second.stats.newRaw).toBe(4)
+  })
+
+  it('prepare accounts for hidden weights (api) and supports explicit through catch-up', async () => {
+    config = loadConfig({ dataDir: dir, budgetTokens: BUDGET_TOKENS, ledgerRebuildEvery: 0, prepareMinChars: 1 })
+    const sig = 's'.repeat(8_000)
+    const rows = Array.from({ length: 24 }, (_, n) => [user(`p${n}`), thinkingOnly(), call(`c${n}`, '', 'ok'), resultsOf('ok', `c${n}`), answer(`a${n}`)]).flat()
+    const api: ApiMessage[] = Array.from({ length: 24 }, (_, n) => [
+      { role: 'user' as const, content: [{ type: 'text', text: `p${n}` }] },
+      { role: 'assistant' as const, content: [{ type: 'thinking', thinking: '', signature: sig }, { type: 'tool_use', id: `c${n}`, name: 'Read', input: {} }] },
+      { role: 'user' as const, content: [{ type: 'tool_result', tool_use_id: `c${n}`, content: 'ok' }] },
+      { role: 'assistant' as const, content: [{ type: 'text', text: `a${n} ${ANSWER_DETAIL}` }] }
+    ]).flat()
+    // Without api, rows are tiny (~5k chars) -> nothing evicted!
+    const textOnly = await prepare({ sessionKey: SESSION, messages: rows, showCommand: SHOW }, config, fakeLedger)
+    expect(textOnly.prepared).toBe(false)
+    // With api, thinking weighs ~32k tokens -> prepare evicts and folds into ready ledger!
+    const weighted = await prepare({ sessionKey: SESSION, messages: rows, api, showCommand: SHOW }, config, fakeLedger)
+    expect(weighted.prepared).toBe(true)
+
+    // Explicit through catch-up after a ready compaction that left the ledger lagging:
+    rmSync(dir, { recursive: true, force: true })
+    const bigLive = Array.from({ length: 12 }, (_, n) => turn(n)).flat()
+    const compacted = await compact({ sessionKey: SESSION, messages: bigLive, showCommand: SHOW, ledgerMode: 'ready' }, config, fakeLedger)
+    expect(compacted.stats.ledgerThrough).toBe(0)
+    expect(compacted.stats.cut).toBeGreaterThan(0)
+    // High prepareMinChars must NOT block explicit post-compaction catch-up via `through`.
+    const strictCfg = loadConfig({ dataDir: dir, budgetTokens: BUDGET_TOKENS, ledgerRebuildEvery: 0, prepareMinChars: 10_000_000 })
+    const caught = await prepare({ sessionKey: SESSION, through: compacted.stats.cut }, strictCfg, fakeLedger)
+    expect(caught).toEqual({ prepared: true, through: compacted.stats.cut, requests: 1 })
+    expect(readReady(join(dir, 'sessions', SESSION))?.through).toBe(compacted.stats.cut)
+  })
+
+  it('planLedger and preparedLedger round-trip cleanly and reject mismatched prefixHash', async () => {
+    const live = Array.from({ length: 12 }, (_, n) => turn(n)).flat()
+    const plan = planLedger({ sessionKey: SESSION, messages: live, showCommand: SHOW }, config, { enforceMinChars: false })
+    expect(plan.needed).toBe(true)
+    if (!plan.needed) return
+    const result = await compact(
+      {
+        sessionKey: SESSION,
+        messages: live,
+        showCommand: SHOW,
+        ledgerMode: 'ready',
+        preparedLedger: { ledger: '## Current state\n- computed via model.complete (#0)', through: plan.through, prefixHash: plan.prefixHash, age: plan.age, requests: plan.chunks.length }
+      },
+      config,
+      async () => {
+        throw new Error('must not call ledgerFn when preparedLedger is accepted')
+      }
+    )
+    expect(result.stats.ledgerThrough).toBe(plan.through)
+    expect(materialize(live, result.entries)[0].text).toContain('computed via model.complete')
+  })
+
+  it('tolerates truncated trailing lines in archive.jsonl and corrupt state.json', async () => {
+    const live = Array.from({ length: 12 }, (_, n) => turn(n)).flat()
+    const first = await run(live)
+    const sdir = join(dir, 'sessions', SESSION)
+    // Append a truncated trailing line simulating a crash mid-write.
+    appendFileSync(join(sdir, 'archive.jsonl'), '{"seq":999,"role":"user","text":"trun')
+    expect(readArchive(sdir)).toHaveLength(live.length)
+    // Next compaction self-heals archive.jsonl and keeps numbering contiguous.
+    const nextLive = [...materialize(live, first.entries), ...turn(50)]
+    const second = await run(nextLive)
+    expect(second.stats.archived).toBe(live.length + 4)
+    expect(readArchive(sdir)).toHaveLength(live.length + 4)
+
+    // Corrupt state.json falls back to INITIAL_STATE instead of throwing.
+    writeFileSync(join(sdir, 'state.json'), '{not valid json')
+    expect(readState(sdir).compactions).toBe(0)
+    const recovered = await run(turn(60))
+    expect(recovered.stats.branch).toBe(4)
+  })
+
+  it('reclaims stale locks safely and never lets a timed-out holder delete a newer lock', () => {
+    const sdir = join(dir, 'sessions', SESSION)
+    const firstRelease = tryLock(sdir, 'test.lock', 100)!
+    expect(firstRelease).toBeDefined()
+    expect(tryLock(sdir, 'test.lock', 100)).toBeUndefined()
+    // Backdate lock file to make it stale.
+    const old = new Date(Date.now() - 10_000)
+    utimesSync(join(sdir, 'test.lock'), old, old)
+    const secondRelease = tryLock(sdir, 'test.lock', 100)!
+    expect(secondRelease).toBeDefined()
+    // First holder releasing late must NOT unlink second holder's lock!
+    firstRelease()
+    expect(tryLock(sdir, 'test.lock', 100)).toBeUndefined()
+    secondRelease()
+    expect(tryLock(sdir, 'test.lock', 100)).toBeDefined()
+  })
+
+  it('sanitizes image mediaType extensions against path traversal and parameters', () => {
+    expect(mediaExtension('image/png')).toBe('png')
+    expect(mediaExtension('image/jpeg; charset=utf-8')).toBe('jpg')
+    expect(mediaExtension('image/svg+xml')).toBe('svgxml')
+    expect(mediaExtension('image/../../etc/passwd')).toBe('png')
+    expect(mediaExtension('')).toBe('png')
   })
 })

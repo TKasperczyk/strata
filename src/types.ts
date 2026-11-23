@@ -57,4 +57,6 @@ export type SessionState = {
   /** Incremental ledger updates since the last full rebuild. */
   ledgerAge: number
   compactions: number
+  /** Branch cut row of the last compaction, for status/lag reporting. */
+  lastCut?: number
 }

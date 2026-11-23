@@ -3,9 +3,19 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { compact, OversizeError } from '../src/compact.js'
-import { loadConfig, type Config } from '../src/config.js'
+import { CHARS_PER_TOKEN, loadConfig, type Config } from '../src/config.js'
 import type { Message, OutputEntry } from '../src/types.js'
-import { DEFAULT_THINKING_CHARS_PER_TOKEN, hiddenByRow, imageDimensions, imageTokens, lastRequestEnd, thinkingRatio, type ApiMessage } from '../src/weights.js'
+import {
+  calibrateWeights,
+  DEFAULT_THINKING_CHARS_PER_TOKEN,
+  hiddenByRow,
+  imageDimensions,
+  imageTokens,
+  lastRequestEnd,
+  textCharsPerToken,
+  thinkingRatio,
+  type ApiMessage
+} from '../src/weights.js'
 
 const SESSION = 'weights'
 const SHOW = 'strata show weights'
@@ -30,6 +40,25 @@ function jpeg(width: number, height: number): string {
   head.writeUInt16BE(height, 7)
   head.writeUInt16BE(width, 9)
   return head.toString('base64')
+}
+
+/** A JPEG with 0xFF fill bytes, APP0 segment, standalone markers (TEM + RST0), and progressive SOF2. */
+function jpegWithFillAndStandalone(width: number, height: number): string {
+  const parts = [
+    // SOI
+    0xff, 0xd8,
+    // 0xFF fill bytes before APP0 (length = 6, 4 payload bytes)
+    0xff, 0xff, 0xff, 0xe0, 0x00, 0x06, 0x4a, 0x46, 0x49, 0x46,
+    // Standalone TEM (0x01) and RST0 (0xD0) with no length field
+    0xff, 0x01,
+    0xff, 0xff, 0xd0,
+    // Progressive SOF2 (0xC2) with fill byte
+    0xff, 0xff, 0xc2, 0x00, 0x11, 0x08,
+    (height >> 8) & 0xff, height & 0xff,
+    (width >> 8) & 0xff, width & 0xff,
+    0x03, 0, 0, 0, 0, 0, 0, 0
+  ]
+  return Buffer.from(parts).toString('base64')
 }
 
 const user = (text: string): Message => ({ role: 'user', text, toolUses: [] })
@@ -61,10 +90,26 @@ function turns(count: number, from = 0) {
 const materialize = (input: Message[], entries: OutputEntry[]) => entries.map(e => ('keep' in e ? input[e.keep] : e.built))
 
 describe('image sizing', () => {
-  it('reads PNG and JPEG dimensions and prices them at w*h/750', () => {
+  it('reads PNG and JPEG dimensions and applies Anthropic downscaling caps', () => {
     expect(imageDimensions(png(1766, 2000))).toEqual([1766, 2000])
     expect(imageDimensions(jpeg(640, 480))).toEqual([640, 480])
-    expect(imageTokens(png(1500, 1500))).toBe(3_000)
+    // Small image: exact ceil(w*h/750)
+    expect(imageTokens(png(800, 600))).toBe(640)
+    expect(imageTokens(jpeg(640, 480))).toBe(410)
+    // High-res square image: capped at Anthropic's ~1,600-token ceiling
+    expect(imageTokens(png(1500, 1500))).toBe(1_600)
+    expect(imageTokens(png(4000, 3000))).toBe(1_600)
+    // Wide panorama: long edge scaled to 1568px, preserving aspect ratio (3000x600 -> 1568x313.6 -> 656 tokens)
+    expect(imageTokens(png(3000, 600))).toBe(656)
+    // Invalid / zero dimensions fall back safely
+    expect(imageTokens(png(0, 0))).toBe(1_600)
+  })
+
+  it('parses JPEGs with 0xFF fill bytes, standalone markers (TEM/RST), and progressive SOF2', () => {
+    expect(imageDimensions(jpegWithFillAndStandalone(1024, 768))).toEqual([1024, 768])
+    // Stops cleanly at SOS (0xDA) without crashing
+    const sosOnly = Buffer.from([0xff, 0xd8, 0xff, 0xda, 0x00, 0x08, 0, 0, 0, 0, 0, 0]).toString('base64')
+    expect(imageDimensions(sosOnly)).toBeUndefined()
   })
 })
 
@@ -84,6 +129,52 @@ describe('hiddenByRow', () => {
       { role: 'assistant', content: [{ type: 'text', text: 'a cat' }] }
     ]
     expect(hiddenByRow(rows, api).get(0)?.images).toHaveLength(1)
+  })
+
+  it('attaches pasted images that precede prompt text ([image, text]) without mis-advancing cursor', () => {
+    // A later empty-text user row exists — an unbuffered scanner would jump cursor to row 2!
+    const rows = [user('describe this screenshot'), answer('looks good'), user(''), answer('second image')]
+    const api: ApiMessage[] = [
+      { role: 'user', content: [image(png(800, 600)), { type: 'text', text: 'describe this screenshot' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'looks good' }] },
+      { role: 'user', content: [image(png(400, 400))] },
+      { role: 'assistant', content: [{ type: 'text', text: 'second image' }] }
+    ]
+    const hidden = hiddenByRow(rows, api)
+    expect(hidden.get(0)?.images).toHaveLength(1)
+    expect(hidden.get(0)?.imageTokens).toBe(imageTokens(png(800, 600)))
+    expect(hidden.get(2)?.images).toHaveLength(1)
+    expect(hidden.get(2)?.imageTokens).toBe(imageTokens(png(400, 400)))
+  })
+
+  it('distinguishes a merged image-only prompt before a text prompt from [image, text]', () => {
+    const rows = [user(''), user('and here is my question'), answer('got it')]
+    const api: ApiMessage[] = [
+      { role: 'user', content: [image(png(500, 500)), { type: 'text', text: 'and here is my question' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'got it' }] }
+    ]
+    const hidden = hiddenByRow(rows, api)
+    expect(hidden.get(0)?.images).toHaveLength(1)
+    expect(hidden.get(1)).toBeUndefined()
+  })
+
+  it('matches multi-text-block messages joined by newline in SessionMessage.text', () => {
+    const rows = [user('first part\nsecond part'), thinkingRow(), answer('reply part 1\nreply part 2')]
+    const api: ApiMessage[] = [
+      { role: 'user', content: [{ type: 'text', text: 'first part' }, { type: 'text', text: 'second part' }, image(png(600, 600))] },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: '', signature: 'X'.repeat(500) },
+          { type: 'text', text: 'reply part 1' },
+          { type: 'thinking', thinking: '', signature: 'Y'.repeat(700) },
+          { type: 'text', text: 'reply part 2' }
+        ]
+      }
+    ]
+    const hidden = hiddenByRow(rows, api)
+    expect(hidden.get(0)?.images).toHaveLength(1)
+    expect(hidden.get(2)?.thinkingChars).toBe(1200)
   })
 })
 
@@ -137,7 +228,7 @@ describe('third-pass regressions (weights)', () => {
   })
 })
 
-describe('thinkingRatio', () => {
+describe('thinkingRatio and textCharsPerToken calibration', () => {
   it('calibrates against the real window and falls back without a reading', () => {
     const { rows, api } = turns(3)
     const hidden = hiddenByRow(rows, api)
@@ -149,13 +240,48 @@ describe('thinkingRatio', () => {
     const ratio = thinkingRatio(rows, hidden, { tokens: Math.round(1_000 + visible + images + 2_400), overhead: 1_000 })
     expect(ratio).toBeCloseTo(5, 1)
   })
+
+  it('does not blow up thinkingRatio when thinking is a tiny share of a noisy text context', () => {
+    const rows = [
+      user('A'.repeat(350_000)), // 100k est tokens at 3.5 chars/token
+      thinkingRow(),
+      call('c0'),
+      result('c0', 'B'.repeat(350_000)), // another 100k est tokens
+      answer('done')
+    ]
+    const api: ApiMessage[] = [
+      { role: 'user', content: [{ type: 'text', text: rows[0].text }] },
+      { role: 'assistant', content: [{ type: 'thinking', thinking: '', signature: 's'.repeat(4_000) }, { type: 'tool_use', id: 'c0', name: 'Read', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'c0', content: rows[3].toolResults![0].text }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'done' }] }
+    ]
+    const hidden = hiddenByRow(rows, api)
+    // Real visible text ran +10% denser (+20k tokens) than chars/3.5; thinking is only ~1k tokens.
+    const cal = calibrateWeights(rows, hidden, { tokens: 1_000 + 220_000 + 1_000, overhead: 1_000 })
+    // thinkingRatio must stay near default 4.0 instead of collapsing to 1.5!
+    expect(cal.thinkingRatio).toBeGreaterThan(3.5)
+    expect(cal.thinkingRatio).toBeLessThan(4.2)
+    // Instead, text density absorbs the +10% discrepancy (~3.18 chars/token).
+    expect(cal.charsPerToken).toBeLessThan(3.3)
+    expect(cal.charsPerToken).toBeGreaterThan(3.0)
+  })
+
+  it('calibrates textCharsPerToken when there is no thinking at all', () => {
+    const rows = [user('x'.repeat(250_000)), answer('done')]
+    const hidden = new Map()
+    // 250k chars of dense JSON really took 100k tokens -> 2.5 chars/token
+    const cpt = textCharsPerToken(rows, hidden, { tokens: 105_000, overhead: 5_000 })
+    expect(cpt).toBeCloseTo(2.5, 1)
+    expect(textCharsPerToken(rows, hidden, undefined)).toBe(CHARS_PER_TOKEN)
+  })
 })
 
 describe('compaction with the API form', () => {
   let dir: string
   let config: Config
   const noLedger = async (previous: string) => ({ ledger: previous, requests: 0 })
-  const run = (messages: Message[], api?: ApiMessage[]) => compact({ sessionKey: SESSION, messages, showCommand: SHOW, ...(api ? { api } : {}) }, config, noLedger)
+  const run = (messages: Message[], api?: ApiMessage[], usage?: { tokens?: number; overhead?: number }) =>
+    compact({ sessionKey: SESSION, messages, showCommand: SHOW, ...(api ? { api } : {}), ...(usage ? { usage } : {}) }, config, noLedger)
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'strata-weights-'))
@@ -175,7 +301,7 @@ describe('compaction with the API form', () => {
   })
 
   it('archives images as files and points rebuilt results at them', async () => {
-    // Room for a masked middle: one screenshot exchange alone weighs ~10k chars.
+    // Room for a masked middle: one screenshot exchange alone weighs ~9k chars.
     config = loadConfig({ dataDir: dir, budgetTokens: BUDGET_TOKENS * 3, ledgerRebuildEvery: 0 })
     const { rows, api } = turns(8)
     const { entries, stats } = await run(rows, api)
@@ -187,7 +313,9 @@ describe('compaction with the API form', () => {
   })
 
   it('writes no image files when it declines', async () => {
-    const { rows, api } = shotTurn(0, 6_000)
+    // Budget smaller than one 1,600-token image + 1,000-token thinking response (~2,600 tokens).
+    config = loadConfig({ dataDir: dir, budgetTokens: 1_500, ledgerRebuildEvery: 0 })
+    const { rows, api } = shotTurn(0, 2_000)
     await expect(run(rows, api)).rejects.toBeInstanceOf(OversizeError)
     expect(existsSync(join(dir, 'sessions', SESSION, 'media'))).toBe(false)
   })

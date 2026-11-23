@@ -15,6 +15,17 @@ function cut(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}…[+${text.length - max} chars]`
 }
 
+function cutWithSeq(text: string, max: number, seq: number): string {
+  if (text.length <= max) return text
+  if (max < 80) return cut(text, max)
+  const head = Math.floor(max * 0.65)
+  const tail = max - head
+  const omitted = text.length - head - tail
+  const note = `\n…[strata omitted ${omitted.toLocaleString('en-US')} chars; full text is archive seq ${seq}]…\n`
+  const shortened = `${text.slice(0, head)}${note}${tail > 0 ? text.slice(-tail) : ''}`
+  return shortened.length < text.length ? shortened : text
+}
+
 function capInput(value: unknown, max: number): unknown {
   if (typeof value === 'string') return cut(value, max)
   if (Array.isArray(value)) return value.map(v => capInput(v, max))
@@ -28,21 +39,29 @@ export function stub(chars: number, seq: number): string {
   return `${STUB_PREFIX} a ${chars.toLocaleString('en-US')}-char tool result; full text is archive seq ${seq}]`
 }
 
-function maskResultText(text: string, isError: boolean, seq: number, config: Config): string {
+export function maskResultText(text: string, isError: boolean, seq: number, config: Config): string {
   const keep = isError ? config.errorResultChars : config.smallResultChars
-  return text.length <= keep ? text : stub(text.length, seq)
+  if (text.length <= keep) return text
+  const header = stub(text.length, seq)
+  if (keep <= 0) return header
+  const head = isError ? Math.floor(keep * 0.5) : Math.floor(keep * 0.6)
+  const tail = keep - head
+  const excerpt = `${header}\n${text.slice(0, head)}\n…\n${tail > 0 ? text.slice(-tail) : ''}`
+  return excerpt.length < text.length ? excerpt : text
 }
 
 /**
- * The masked form of a raw message: prose stays verbatim, tool calls keep
- * their name and shortened arguments, large results become archive pointers.
- * Tool calls are never dropped, so every claim of work keeps its evidence.
+ * The masked form of a raw message: prose is bounded with head+tail excerpts,
+ * tool calls keep their name and shortened arguments (without mirrored result
+ * text, which lives on the paired result row with its own seq), and large tool
+ * results become an archive pointer with head+tail excerpts. Tool calls are
+ * never dropped, so every claim of work keeps its evidence.
  */
 export function maskMessage(m: Message, seq: number, config: Config): Message {
   if (m.role === 'user') {
     return {
       role: 'user',
-      text: cut(m.text, config.userTextCapChars),
+      text: cutWithSeq(m.text, config.userTextCapChars, seq),
       toolUses: [],
       ...(m.toolResults
         ? {
@@ -56,13 +75,11 @@ export function maskMessage(m: Message, seq: number, config: Config): Message {
   }
   return {
     role: 'assistant',
-    text: m.text,
+    text: cutWithSeq(m.text, config.assistantTextCapChars, seq),
     toolUses: m.toolUses.map((u): ToolUse => ({
       tool_use_id: u.tool_use_id,
       tool: u.tool,
-      input: capInput(u.input, config.inputCapChars) as Record<string, unknown>,
-      ...(u.text !== undefined ? { text: maskResultText(u.text, u.isError === true, seq, config) } : {}),
-      ...(u.isError ? { isError: true as const } : {})
+      input: capInput(u.input, config.inputCapChars) as Record<string, unknown>
     }))
   }
 }

@@ -15,6 +15,8 @@ export type Config = {
   errorResultChars: number
   /** User text longer than this is cut in the masked layer (large pastes). */
   userTextCapChars: number
+  /** Assistant text longer than this is cut in the masked layer (large dumps). */
+  assistantTextCapChars: number
   ledgerModel: string
   /** Rebuild the ledger from the whole archive every N compactions; 0 disables. */
   ledgerRebuildEvery: number
@@ -49,7 +51,8 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     smallResultChars: 300,
     errorResultChars: 1_000,
     userTextCapChars: 4_000,
-    ledgerModel: process.env.STRATA_LEDGER_MODEL ?? 'claude-sonnet-5-5',
+    assistantTextCapChars: 4_000,
+    ledgerModel: process.env.STRATA_LEDGER_MODEL ?? 'sonnet',
     ledgerRebuildEvery: envInt('STRATA_LEDGER_REBUILD_EVERY', 5, 0),
     ledgerChunkChars: 400_000,
     ledgerRebuildMaxRequests: 3,

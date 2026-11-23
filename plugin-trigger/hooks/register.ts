@@ -8,12 +8,23 @@ const DEFAULT_TRIGGER_TOKENS = 900_000
 const STUCK_AFTER_MS = 10 * 60 * 1000
 const STATUS_COMMAND = 'strata-status'
 
-/** What the last turns saw and did, for /strata-status; module state, reset by a reload. */
+/** What the last turns saw and did, for /strata-status; reset on session.start. */
 const status = {
   lastTokens: undefined as number | undefined,
   lastCheckedAt: undefined as number | undefined,
   compactingSince: undefined as number | undefined,
   lastOutcome: 'no compaction started yet'
+}
+
+/** Monotonic token for the active compaction attempt; stops stale settlements from clobbering newer ones. */
+let activeAttempt = 0
+
+function resetStatus(): void {
+  activeAttempt++
+  status.lastTokens = undefined
+  status.lastCheckedAt = undefined
+  status.compactingSince = undefined
+  status.lastOutcome = 'no compaction started yet'
 }
 
 async function triggerTokens($: EngineInterface): Promise<number> {
@@ -27,6 +38,7 @@ function describe(error: unknown): string {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    resetStatus()
     await $.command.register({ name: STATUS_COMMAND, description: 'Shows what strata-trigger last saw and did' })
     return next(e)
   })
@@ -43,7 +55,7 @@ export const register: Register = on => {
         `last outcome: ${status.lastOutcome}`
       ].join('\n')
     }
-  })
+  }).catch(() => ({ text: 'strata-trigger: failed to read status' }))
 
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
@@ -53,25 +65,39 @@ export const register: Register = on => {
     const tokens = (await $.session.usage()).context.tokens
     status.lastTokens = tokens
     status.lastCheckedAt = now
+    const trigger = await triggerTokens($)
     if (status.compactingSince !== undefined) {
       if (now - status.compactingSince < STUCK_AFTER_MS) return result
-      $.ui.log(`a compaction started ${Math.round((now - status.compactingSince) / 60000)} min ago never settled; triggering again`)
+      const stuckMin = Math.round((now - status.compactingSince) / 60000)
+      // Abandon the stuck attempt so a late settlement cannot clobber the next compaction.
+      activeAttempt++
+      status.compactingSince = undefined
+      if ((tokens ?? 0) < trigger) {
+        $.ui.log(`a compaction started ${stuckMin} min ago never settled; clearing stuck state`)
+        return result
+      }
+      $.ui.log(`a compaction started ${stuckMin} min ago never settled; triggering again`)
     }
-    if ((tokens ?? 0) < (await triggerTokens($))) return result
+    if ((tokens ?? 0) < trigger) return result
+    const attempt = ++activeAttempt
     status.compactingSince = now
     // After the turn has settled: compaction is refused while a turn runs.
     $.clock.after(0, () => {
       $.session
         .compact()
         .then(answer => {
+          if (attempt !== activeAttempt) return
           status.lastOutcome = 'skip' in answer && answer.skip ? `skipped: ${answer.skip}` : `compacted from ${tokens?.toLocaleString('en-US')} tokens`
         })
         .catch(error => {
+          if (attempt !== activeAttempt) return
           status.lastOutcome = `refused: ${describe(error)}`
           // Shown, not just debug-logged: a silent refusal looks exactly like "never triggered".
           $.ui.log(`compaction refused, will retry after the next turn: ${describe(error)}`)
         })
-        .finally(() => (status.compactingSince = undefined))
+        .finally(() => {
+          if (attempt === activeAttempt) status.compactingSince = undefined
+        })
     })
     return result
   })

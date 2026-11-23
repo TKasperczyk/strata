@@ -1,0 +1,188 @@
+import { execFileSync } from 'child_process'
+import { mkdtempSync, rmSync } from 'fs'
+import { tmpdir } from 'os'
+import { join, resolve } from 'path'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { compact } from '../src/compact.js'
+import { loadConfig, type Config } from '../src/config.js'
+import { formatSessionStatus, searchArchive, sessionStatus, showArchive } from '../src/query.js'
+import { writeReady, prefixHash } from '../src/ready.js'
+import { readArchive } from '../src/archive.js'
+import type { Message } from '../src/types.js'
+
+const SESSION = 'query-sess'
+const SHOW = 'strata show query-sess'
+
+const user = (text: string): Message => ({ role: 'user', text, toolUses: [] })
+const assistant = (text: string): Message => ({ role: 'assistant', text, toolUses: [] })
+const call = (id: string, command: string): Message => ({
+  role: 'assistant',
+  text: '',
+  toolUses: [{ tool_use_id: id, tool: 'Bash', input: { command } }]
+})
+const res = (id: string, text: string, isError = false): Message => ({
+  role: 'user',
+  text: '',
+  toolUses: [],
+  toolResults: [{ tool_use_id: id, text, isError }]
+})
+
+describe('archive query, search, and status', () => {
+  let dir: string
+  let config: Config
+  const noLedger = async (prev: string) => ({ ledger: prev || '## Current state\n- active (#0)', requests: 1 })
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'strata-query-'))
+    config = loadConfig({ dataDir: dir, budgetTokens: 2_000, ledgerRebuildEvery: 0 })
+  })
+  afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+  it('paginates archived messages with offset and limit', async () => {
+    const msgs = [
+      user('start'),
+      call('b1', 'cat huge.log'),
+      res('b1', `START_LOG_${'L'.repeat(5_000)}_END_LOG`),
+      assistant('finished reading log')
+    ]
+    await compact({ sessionKey: SESSION, messages: msgs, showCommand: SHOW }, config, noLedger)
+    const sdir = join(dir, 'sessions', SESSION)
+
+    const page1 = showArchive(sdir, { from: 2, offset: 0, limit: 500 })
+    expect(page1.found).toBe(true)
+    expect(page1.hasMore).toBe(true)
+    expect(page1.nextOffset).toBe(500)
+    expect(page1.text).toContain('START_LOG_')
+    expect(page1.text).toContain('pass offset=500 to continue')
+
+    const pageEnd = showArchive(sdir, { from: 2, offset: page1.totalChars - 50, limit: 500 })
+    expect(pageEnd.hasMore).toBe(false)
+    expect(pageEnd.text).toContain('_END_LOG')
+
+    const pastEnd = showArchive(sdir, { from: 2, offset: 99_999, limit: 500 })
+    expect(pastEnd.found).toBe(true)
+    expect(pastEnd.returnedChars).toBe(0)
+    expect(pastEnd.text).toContain('past end of output')
+
+    const missing = showArchive(sdir, { from: 999 })
+    expect(missing.found).toBe(false)
+  })
+
+  it('searches active branch by default, supports filters and regex, and excludes rewound branches', async () => {
+    const first = [
+      user('deploy staging'),
+      call('c1', 'deploy --flag-alpha'),
+      res('c1', 'Error: ECONNREFUSED on port 9090', true),
+      assistant('staging failed on port 9090'),
+      user('P'.repeat(4_000))
+    ]
+    const r1 = await compact({ sessionKey: SESSION, messages: first, showCommand: SHOW }, config, noLedger)
+    const out1 = r1.entries.map(e => ('keep' in e ? first[e.keep] : e.built))
+
+    // Rewind right after seq 0/header and take a different branch without "ECONNREFUSED"
+    const rewound = [out1[0], user('switch to local dev'), assistant('local dev works on port 3000')]
+    await compact({ sessionKey: SESSION, messages: rewound, showCommand: SHOW }, config, noLedger)
+    const sdir = join(dir, 'sessions', SESSION)
+
+    // Active branch only: does not find the abandoned branch's error unless all-branches is set.
+    const activeOnly = searchArchive(sdir, { query: 'ECONNREFUSED' })
+    expect(activeOnly.branchScoped).toBe(true)
+    expect(activeOnly.totalMatches).toBe(0)
+
+    const allBranches = searchArchive(sdir, { query: 'ECONNREFUSED', branchOnly: false, errorsOnly: true })
+    expect(allBranches.branchScoped).toBe(false)
+    expect(allBranches.totalMatches).toBe(1)
+    expect(allBranches.matches[0].hasError).toBe(true)
+
+    const regexHit = searchArchive(sdir, { query: 'port \\d{4}', regex: true, role: 'assistant' })
+    expect(regexHit.totalMatches).toBe(1)
+    expect(regexHit.matches[0].snippet).toContain('port 3000')
+
+    expect(() => searchArchive(sdir, { query: '[unclosed', regex: true })).toThrow(/invalid regex/)
+  })
+
+  it('reports accurate sessionStatus including ledger lag and ready-ledger compatibility', async () => {
+    const msgs = Array.from({ length: 12 }, (_, n) => [
+      user(`prompt ${n}`),
+      call(`c${n}`, `echo ${n}`),
+      res(`c${n}`, 'x'.repeat(2_000)),
+      assistant(`done ${n}`)
+    ]).flat()
+    const compacted = await compact({ sessionKey: SESSION, messages: msgs, showCommand: SHOW, ledgerMode: 'ready' }, config, noLedger)
+    const sdir = join(dir, 'sessions', SESSION)
+    const status1 = sessionStatus(sdir, SESSION)
+    expect(status1.archiveCount).toBe(msgs.length)
+    expect(status1.branchLength).toBe(msgs.length)
+    expect(status1.compactions).toBe(1)
+    expect(status1.lastCut).toBe(compacted.stats.cut)
+    expect(status1.ledgerLag).toBe(compacted.stats.cut)
+    expect(status1.readyLedger).toBeUndefined()
+
+    const archived = readArchive(sdir)
+    writeReady(sdir, {
+      ledger: '## Current state\n- ready (#0)',
+      through: compacted.stats.cut,
+      prefixHash: prefixHash(archived, compacted.stats.cut),
+      age: 0,
+      preparedAt: '2026-10-12T12:00:00.000Z'
+    })
+    const status2 = sessionStatus(sdir, SESSION)
+    expect(status2.readyLedger?.compatible).toBe(true)
+    expect(formatSessionStatus(status2)).toContain('ready ledger:')
+    expect(formatSessionStatus(status2)).toContain('compatible')
+  })
+
+  it('CLI handles show pagination, search with leading-dash queries, status --json, and ledger-plan/save', async () => {
+    const msgs = Array.from({ length: 10 }, (_, n) => [
+      user(`task ${n} with --weird-flag`),
+      call(`k${n}`, `run --weird-flag ${n}`),
+      res(`k${n}`, 'R'.repeat(3_000)),
+      assistant(`completed ${n}`)
+    ]).flat()
+    const cliPath = resolve('dist/cli.js')
+    const env = { ...process.env, STRATA_DATA_DIR: dir }
+
+    // 1. ledger-plan over stdin
+    const planOut = execFileSync('node', [cliPath, 'ledger-plan', '--session', SESSION, '--in', '-', '--budget', '2000', '--sync'], {
+      input: JSON.stringify({ messages: msgs }),
+      env,
+      encoding: 'utf-8'
+    })
+    const plan = JSON.parse(planOut)
+    expect(plan.needed).toBe(true)
+
+    // 2. ledger-save over stdin
+    const saveOut = execFileSync('node', [cliPath, 'ledger-save', '--session', SESSION, '--in', '-'], {
+      input: JSON.stringify({ ledger: '## Current state\n- saved via CLI (#0)', through: plan.through, prefixHash: plan.prefixHash, age: plan.age }),
+      env,
+      encoding: 'utf-8'
+    })
+    expect(JSON.parse(saveOut).saved).toBe(true)
+
+    // 3. compact adopting ready ledger + --native-tools
+    const compactOut = execFileSync('node', [cliPath, 'compact', '--session', SESSION, '--in', '-', '--out', '-', '--budget', '2000', '--ledger', 'ready', '--native-tools'], {
+      input: JSON.stringify({ messages: msgs }),
+      env,
+      encoding: 'utf-8'
+    })
+    const compacted = JSON.parse(compactOut)
+    expect(compacted.stats.ledgerThrough).toBe(plan.through)
+    expect(compacted.entries[0].built.text).toContain('mcp__strata__show')
+    expect(compacted.entries[0].built.text).toContain('mcp__strata__search')
+
+    // 4. show with --offset and --limit
+    const showOut = execFileSync('node', [cliPath, 'show', '--offset', '0', '--limit', '120', '--', SESSION, '2'], { env, encoding: 'utf-8' })
+    expect(showOut).toContain('pass offset=120 to continue')
+
+    // 5. search for a query starting with "--"
+    const searchOut = execFileSync('node', [cliPath, 'search', '--', SESSION, '--weird-flag'], { env, encoding: 'utf-8' })
+    expect(searchOut).toContain('strata search "--weird-flag"')
+    expect(searchOut).toContain('#0')
+
+    // 6. status --json
+    const statusOut = execFileSync('node', [cliPath, 'status', '--json', '--', SESSION], { env, encoding: 'utf-8' })
+    const st = JSON.parse(statusOut)
+    expect(st.compactions).toBe(1)
+    expect(st.ledgerLag).toBe(0)
+  })
+})
