@@ -2,15 +2,15 @@ import { mkdirSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { appendArchive, archivePath, fingerprint, matchedPrefix, numberMessages, readArchive, readState, sessionDir, writeState } from './archive.js'
 import { budgetChars, shareChars, type Config } from './config.js'
-import { renderIndex, segmentEpisodes } from './episodes.js'
-import { LEDGER_SYSTEM_PROMPT, ledgerMaxTokens, ledgerRequests, renderSpan, trimLedger, updateLedger, type LedgerUpdate } from './ledger.js'
-import { messageChars } from './mask.js'
+import { renderEpisode, renderIndex, segmentEpisodes } from './episodes.js'
+import { LEDGER_SYSTEM_PROMPT, ledgerMaskConfig, ledgerMaxTokens, ledgerRequests, renderSpan, trimLedger, updateLedger, type LedgerUpdate } from './ledger.js'
+import { maskMessage, messageChars, renderMessage, safeSlicePrefix } from './mask.js'
 import { acquireLock, compatibleReady, prefixHash, tryLock, writeReady } from './ready.js'
-import type { ArchivedMessage, Message, OutputEntry, OutputRecord, SessionState } from './types.js'
-import { isPrompt as isUnitPrompt, rebuildUnit, segmentUnits, unitChars, type Unit } from './units.js'
+import { HEADER_MARK, type ArchivedMessage, type Message, type OutputEntry, type OutputRecord, type SessionState } from './types.js'
+import { isPrompt as isUnitPrompt, rebuildUnit, segmentUnits, type Unit } from './units.js'
 import { calibratedTextChars, calibrateWeights, hiddenByRow, hiddenChars, type ApiMessage, type Hidden, type UsageReading } from './weights.js'
 
-export const HEADER_MARK = '[strata: compacted conversation]'
+export { HEADER_MARK }
 
 export type PreparedLedger = {
   ledger: string
@@ -167,7 +167,7 @@ function reconcile(dir: string, input: Message[], state: SessionState): Reconcil
   }
   // A stray header of ours past the matched part is derived content, never history.
   const fresh = input.map((_, i) => i).slice(matched).filter(i => !input[i].text.startsWith(HEADER_MARK))
-  const nextSeq = archive.length ? Math.max(archive.length, archive[archive.length - 1].seq + 1) : 0
+  const nextSeq = archive.reduce((max, m) => Math.max(max, m.seq + 1), archive.length)
   const pending = numberMessages(nextSeq, fresh.map(i => input[i]))
   fresh.forEach((inputIndex, k) => inputBySeq.set(pending[k].seq, inputIndex))
   const all = [...archive, ...pending]
@@ -191,10 +191,17 @@ function headerPreamble(input: CompactInput, dir: string): string {
   return `${HEADER_MARK} Older turns of this session were moved out of context. Every message's text is archived in ${archivePath(dir)} (one JSON message per line; line N+1 is seq N), and its images as files under ${join(dir, 'media')}. ${access} "[strata elided …]" markers in the turns below point to archived tool results; read the archive or re-run the tool when you need the exact text. Never treat the index or ledger as proof that work happened: verify against files, git, or the archive before relying on it.`
 }
 
-function buildHeader(input: CompactInput, dir: string, evicted: ArchivedMessage[], ledger: string, ledgerThrough: number, config: Config): string {
+function buildHeader(
+  input: CompactInput,
+  dir: string,
+  evicted: ArchivedMessage[],
+  ledger: string,
+  ledgerThrough: number,
+  config: Config
+): string {
   const pinned = evicted.find(isPrompt)
   const sections = [headerPreamble(input, dir)]
-  if (pinned) sections.push(`## Original request (seq ${pinned.seq})\n${pinned.text.slice(0, shareChars(config, 'pinned'))}`)
+  if (pinned) sections.push(`## Original request (seq ${pinned.seq})\n${safeSlicePrefix(pinned.text, shareChars(config, 'pinned'))}`)
   if (ledger) {
     // A ledger that lags the cut says so, so the gap is looked up, not assumed empty.
     const lag = ledgerThrough < evicted.length
@@ -250,7 +257,7 @@ function layout(
   }
 
   const fitsWithoutEviction = sum(masked, 0, protectedFrom) + sum(verbatim, protectedFrom, verbatim.length) <= budget
-  let h = fitsWithoutEviction ? 0 : headerAt(Math.max(1, protectedFrom))
+  let h = fitsWithoutEviction || protectedFrom === 0 ? 0 : headerAt(protectedFrom)
   let tail = protectedFrom
   let cut = 0
   for (let iter = 0; iter < 4; iter++) {
@@ -289,6 +296,15 @@ function layout(
     const candidate = cut - 1
     const nextTotal = (candidate > 0 ? headerAt(candidate) : 0) + sum(masked, candidate, tail) + sum(verbatim, tail, verbatim.length)
     if (nextTotal <= budget) cut = candidate
+    else break
+  }
+
+  // When nothing is evicted (cut === 0) and masked middle leaves room unused, let
+  // unused middle slack promote turns back into the verbatim tail (up to budget - middleFloor).
+  while (cut === 0 && tail > 0) {
+    const nextTailUsed = sum(verbatim, tail - 1, verbatim.length)
+    const nextTotal = sum(masked, 0, tail - 1) + nextTailUsed
+    if (nextTotal <= budget && nextTailUsed <= budget - middleFloor) tail--
     else break
   }
   return { cut, tail }
@@ -385,16 +401,25 @@ function chooseLedgerWork(
       chunks = fullChunks
       nextAge = 0
     } else {
-      // Keep the newest rows that fit within the request cap alongside the existing ledger.
+      // Keep the newest rows whose masked ledger rendering fits within the request cap.
+      const maskCfg = ledgerMaskConfig(config)
       const capChars = maxChunks * config.ledgerChunkChars
       let start = fullSpan.length
       let acc = 0
-      while (start > 0 && acc + messageChars(fullSpan[start - 1]) <= capChars) {
+      while (start > 0) {
+        const m = fullSpan[start - 1]
+        const len = renderMessage(maskMessage(m, m.seq, maskCfg), m.seq).length + 1
+        if (acc > 0 && acc + len > capChars) break
         start--
-        acc += messageChars(fullSpan[start])
+        acc += len
       }
-      span = fullSpan.slice(Math.min(start, fullSpan.length - 1))
-      chunks = renderSpan(span, config).slice(-maxChunks)
+      span = fullSpan.slice(start)
+      chunks = renderSpan(span, config)
+      while (chunks.length > maxChunks && span.length > 1) {
+        span = span.slice(1)
+        chunks = renderSpan(span, config)
+      }
+      if (chunks.length > maxChunks) chunks = chunks.slice(-maxChunks)
       nextAge = base.ledgerAge + 1
     }
   } else {
@@ -455,11 +480,13 @@ type Plan = {
   reconciled: Reconciled
   rows: ArchivedMessage[]
   base: LedgerState
+  adoptedLedger?: LedgerState
   units: Unit[]
   handles: Array<Array<number | undefined>>
   whole: boolean[]
   rawBuilt: Message[][]
   maskedBuilt: Message[][]
+  maskedSizes: number[]
   verbatim: number[]
   cut: number
   tail: number
@@ -501,32 +528,64 @@ function planCompaction(input: CompactInput, config: Config, reserveFullLedger?:
   }
   const rawBuilt = units.map(u => rebuildUnit(rows.slice(u.start, u.end), 'raw', config))
   const maskedBuilt = units.map(u => rebuildUnit(rows.slice(u.start, u.end), 'masked', config))
-  const maskedSizes = maskedBuilt.map(unitChars)
-  // A row kept whole goes back with its images, thinking, and real text density: count them too.
+  const scaledMessagesChars = (msgs: Message[]) =>
+    msgs.reduce((n, m) => n + calibratedTextChars(messageChars(m), charsPerToken), 0)
+  const maskedSizes = maskedBuilt.map(scaledMessagesChars)
+  // Rows kept whole carry images, thinking, and real text density; rebuilt body rows carry calibrated text density too.
   const rowChars = (m: ArchivedMessage) =>
     calibratedTextChars(messageChars(m), charsPerToken) + hiddenChars(hidden.get(inputBySeq.get(m.seq)!), ratio)
-  const verbatim = units.map((u, k) => (whole[k] ? rows.slice(u.start, u.end).reduce((n, m) => n + rowChars(m), 0) : unitChars(rawBuilt[k])))
+  const verbatim = units.map((u, k) => (whole[k] ? rows.slice(u.start, u.end).reduce((n, m) => n + rowChars(m), 0) : scaledMessagesChars(rawBuilt[k])))
   const base = bestLedger(dir, state, rows, ledgerStale)
   const budget = budgetChars(config)
   const ledgerCap = shareChars(config, 'ledger')
 
-  // In ready mode (without an incoming preparedLedger), we already know the exact
-  // ledger that will be shown; in sync mode or prepare, reserve the ledger's cap
-  // (and squeeze it out before declining if the protected tail needs the room).
-  const fullReserve = reserveFullLedger ?? (input.ledgerMode !== 'ready' || input.preparedLedger !== undefined)
-  const preferredLedgerChars = fullReserve ? ledgerCap : Math.min(base.ledger.length, ledgerCap)
+  // Adopt a valid host-computed ledger right here so layout sizes against its
+  // actual length and exact `ledgerThrough` instead of wasting the full 6% cap.
+  const provided = input.preparedLedger
+  const adoptedLedger: LedgerState | undefined =
+    provided && provided.through <= rows.length && prefixHash(rows, provided.through) === provided.prefixHash
+      ? {
+          ledger: trimLedger(provided.ledger, ledgerCap),
+          ledgerThrough: provided.through,
+          ledgerAge: provided.age,
+          requests: provided.requests
+        }
+      : undefined
+  const knownLedger = adoptedLedger ?? base
+  const ledgerKnown = adoptedLedger !== undefined || input.ledgerError !== undefined || input.ledgerMode === 'ready'
+  const fullReserve = reserveFullLedger ?? !ledgerKnown
+  const preferredLedgerChars = fullReserve ? ledgerCap : Math.min(knownLedger.ledger.length, ledgerCap)
 
   const makeHeaderSizer = (ledgerChars: number) => {
     const cache = new Map<number, number>()
     const placeholder = ledgerChars > 0 ? 'x'.repeat(ledgerChars) : ''
+    const indexCap = shareChars(config, 'index')
     return (cut: number): number => {
       if (cut <= 0) return 0
       const hit = cache.get(cut)
       if (hit !== undefined) return hit
       const evicted = rows.slice(0, units[cut].start)
-      let size = buildHeader(input, dir, evicted, placeholder, base.ledgerThrough, config).length
-      if (fullReserve) {
-        size = Math.max(size, buildHeader(input, dir, evicted, placeholder, evicted.length, config).length)
+      if (!fullReserve) {
+        const size = buildHeader(input, dir, evicted, placeholder, knownLedger.ledgerThrough, config).length
+        cache.set(cut, size)
+        return size
+      }
+      // In sync/prepare mode, the final ledgerThrough is not known yet. Bound the
+      // episode index across all possible protectAfterSeq values (never above indexCap)
+      // so assembly can never overflow the budget due to index merge-order variance.
+      const episodes = segmentEpisodes(evicted)
+      const fullIdxLen = episodes.map(renderEpisode).join('\n').length
+      const baseProtect = base.ledgerThrough < evicted.length ? evicted[base.ledgerThrough]?.seq : undefined
+      const baseIdxLen = renderIndex(episodes, indexCap, { protectAfterSeq: baseProtect }).length
+      const indexSlack = fullIdxLen > indexCap ? Math.max(0, indexCap - baseIdxLen) : 0
+      let size = buildHeader(input, dir, evicted, placeholder, base.ledgerThrough, config).length + indexSlack
+      if (placeholder && base.ledgerThrough < evicted.length && evicted.length > 1) {
+        // Also bound the lag notice with the widest seq numbers in `evicted`.
+        const maxLagHeader = buildHeader(input, dir, evicted, placeholder, evicted.length - 1, config).length
+        const lagProtect = evicted[evicted.length - 1]?.seq
+        const lagIdxLen = renderIndex(episodes, indexCap, { protectAfterSeq: lagProtect }).length
+        const lagSlack = fullIdxLen > indexCap ? Math.max(0, indexCap - lagIdxLen) : 0
+        size = Math.max(size, maxLagHeader + lagSlack)
       }
       cache.set(cut, size)
       return size
@@ -551,11 +610,13 @@ function planCompaction(input: CompactInput, config: Config, reserveFullLedger?:
     reconciled,
     rows,
     base,
+    ...(adoptedLedger ? { adoptedLedger } : {}),
     units,
     handles,
     whole,
     rawBuilt,
     maskedBuilt,
+    maskedSizes,
     verbatim,
     ...picked,
     cutRow: units[picked.cut].start
@@ -567,20 +628,33 @@ export async function compact(input: CompactInput, config: Config, ledgerFn: Led
   const release = await acquireLock(dir, 'compact.lock')
   try {
     const plan = planCompaction(input, config)
-    const { state, rows, base, units, handles, whole, rawBuilt, maskedBuilt, verbatim, cut, tail, cutRow, hidden, ratio, charsPerToken, mediaWrites } = plan
+    const {
+      state,
+      rows,
+      base,
+      adoptedLedger,
+      units,
+      handles,
+      whole,
+      rawBuilt,
+      maskedBuilt,
+      maskedSizes,
+      verbatim,
+      cut,
+      tail,
+      cutRow,
+      hidden,
+      ratio,
+      charsPerToken,
+      mediaWrites
+    } = plan
     const { all, pending, branch, matched } = plan.reconciled
     const tailRow = units[tail].start
     const budget = budgetChars(config)
 
     let ledger: LedgerState
-    const provided = input.preparedLedger
-    if (provided && provided.through <= rows.length && prefixHash(rows, provided.through) === provided.prefixHash) {
-      ledger = {
-        ledger: trimLedger(provided.ledger, shareChars(config, 'ledger')),
-        ledgerThrough: provided.through,
-        ledgerAge: provided.age,
-        requests: provided.requests
-      }
+    if (adoptedLedger) {
+      ledger = adoptedLedger
     } else if (input.ledgerError) {
       ledger = { ...base, error: input.ledgerError }
     } else if (input.ledgerMode === 'ready') {
@@ -595,8 +669,14 @@ export async function compact(input: CompactInput, config: Config, ledgerFn: Led
     let tailHidden = 0
     const emitBuilt = (m: Message, upto: number, layer: keyof typeof layers) => {
       entries.push({ built: m })
-      records.push({ fp: fingerprint(m), upto, seq: -1 })
-      layers[layer] += messageChars(m)
+      records.push({
+        fp: fingerprint(m),
+        upto,
+        seq: -1,
+        role: m.role,
+        ...(layer === 'header' ? { isHeader: true as const } : {})
+      })
+      layers[layer] += layer === 'header' ? messageChars(m) : calibratedTextChars(messageChars(m), charsPerToken)
     }
     const body: Array<() => void> = []
     for (let u = cut; u < tail; u++) {
@@ -609,7 +689,12 @@ export async function compact(input: CompactInput, config: Config, ledgerFn: Led
         handles[u].forEach((inputIndex, k) => {
           body.push(() => {
             entries.push({ keep: inputIndex! })
-            records.push({ fp: fingerprint(input.messages[inputIndex!]), upto: start + k + 1, seq: rows[start + k].seq })
+            records.push({
+              fp: fingerprint(input.messages[inputIndex!]),
+              upto: start + k + 1,
+              seq: rows[start + k].seq,
+              role: rows[start + k].role
+            })
             const extra = hiddenChars(hidden.get(inputIndex!), ratio)
             tailHidden += extra
             layers.tail += calibratedTextChars(messageChars(rows[start + k]), charsPerToken) + extra
@@ -621,7 +706,7 @@ export async function compact(input: CompactInput, config: Config, ledgerFn: Led
     }
     if (cutRow > 0) {
       const evicted = rows.slice(0, cutRow)
-      const bodyChars = maskedBuilt.slice(cut, tail).reduce((n, b) => n + unitChars(b), 0) + verbatim.slice(tail).reduce((a, b) => a + b, 0)
+      const bodyChars = maskedSizes.slice(cut, tail).reduce((a, b) => a + b, 0) + verbatim.slice(tail).reduce((a, b) => a + b, 0)
       const emptyHeader = buildHeader(input, dir, evicted, '', ledger.ledgerThrough, config).length
       const probeHeader = buildHeader(input, dir, evicted, 'x', ledger.ledgerThrough, config).length
       const ledgerWrapper = probeHeader - emptyHeader - 1

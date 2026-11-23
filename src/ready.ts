@@ -122,9 +122,12 @@ export function tryLock(dir: string, lockFile = LOCK_FILE, staleMs = STALE_LOCK_
 
   // Existing lock: inspect without throwing on concurrent removal.
   let mtimeMs: number
+  let ino: number
   let ownerToken: string | undefined
   try {
-    mtimeMs = statSync(path).mtimeMs
+    const st = statSync(path)
+    mtimeMs = st.mtimeMs
+    ino = st.ino
     ownerToken = readFileSync(path, 'utf-8')
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
@@ -135,9 +138,10 @@ export function tryLock(dir: string, lockFile = LOCK_FILE, staleMs = STALE_LOCK_
 
   if (Date.now() - mtimeMs <= staleMs) return undefined
 
-  // Reclaim stale lock only if it still holds the same stale token.
+  // Reclaim stale lock only if inode, mtime, and token still match the stale entry.
   try {
-    if (readFileSync(path, 'utf-8') === ownerToken && statSync(path).mtimeMs === mtimeMs) {
+    const current = statSync(path)
+    if (current.ino === ino && current.mtimeMs === mtimeMs && readFileSync(path, 'utf-8') === ownerToken) {
       rmSync(path, { force: true })
     }
   } catch {

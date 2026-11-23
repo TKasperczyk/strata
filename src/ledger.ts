@@ -1,6 +1,6 @@
 import { CLAUDE_CODE_SYSTEM_PROMPT, createAnthropicClient } from './anthropic.js'
 import { estimateTokens, shareChars, type Config } from './config.js'
-import { maskMessage, renderMessage } from './mask.js'
+import { maskMessage, renderMessage, safeSlicePrefix } from './mask.js'
 import type { ArchivedMessage } from './types.js'
 
 export const LEDGER_SYSTEM_PROMPT = `You maintain the state ledger of a long Claude Code session whose older turns are being moved out of the live context into an archive.
@@ -50,16 +50,32 @@ export function ledgerMaskConfig(config: Config): Config {
 
 export function renderSpan(messages: ArchivedMessage[], config: Config): string[] {
   const maskCfg = ledgerMaskConfig(config)
+  const maxChunk = Math.max(1, config.ledgerChunkChars)
   const chunks: string[] = []
   let current = ''
-  for (const m of messages) {
-    const line = renderMessage(maskMessage(m, m.seq, maskCfg), m.seq)
-    if (!line) continue
-    if (current && current.length + line.length > config.ledgerChunkChars) {
+  const pushPiece = (piece: string) => {
+    if (!piece) return
+    const bounded =
+      piece.length + 1 <= maxChunk
+        ? piece
+        : maxChunk > 18
+          ? `${safeSlicePrefix(piece, maxChunk - 17)}…[chunk capped]`
+          : safeSlicePrefix(piece, Math.max(1, maxChunk - 1))
+    if (current && current.length + bounded.length + 1 > maxChunk) {
       chunks.push(current)
       current = ''
     }
-    current += `${line}\n`
+    current += `${bounded}\n`
+  }
+  for (const m of messages) {
+    const rendered = renderMessage(maskMessage(m, m.seq, maskCfg), m.seq)
+    if (!rendered) continue
+    if (rendered.length + 1 <= maxChunk) {
+      pushPiece(rendered)
+    } else {
+      // Split multi-block messages across chunks so no single chunk exceeds ledgerChunkChars.
+      for (const line of rendered.split('\n')) pushPiece(line)
+    }
   }
   if (current) chunks.push(current)
   return chunks
@@ -131,18 +147,14 @@ export function trimLedger(ledger: string, maxChars: number, note = '\n…[ledge
       sections.push({ heading: line, ...meta, lines: [], trimmed: false })
     } else if (sections.length === 0) {
       preambleLines.push(line)
-    } else {
+    } else if (line.trim()) {
       sections[sections.length - 1].lines.push(line)
     }
   }
-  for (const s of sections) {
-    while (s.lines.length && !s.lines[0].trim()) s.lines.shift()
-    while (s.lines.length && !s.lines[s.lines.length - 1].trim()) s.lines.pop()
-  }
 
   if (sections.length === 0) {
-    if (maxChars <= note.length) return ledger.slice(0, maxChars)
-    return `${ledger.slice(0, maxChars - note.length).trimEnd()}${note}`
+    if (maxChars <= note.length) return safeSlicePrefix(ledger, maxChars)
+    return `${safeSlicePrefix(ledger, maxChars - note.length).trimEnd()}${note}`
   }
 
   let preamble = preambleLines.join('\n').trim()
@@ -154,48 +166,50 @@ export function trimLedger(ledger: string, maxChars: number, note = '\n…[ledge
     current = renderSections(preamble, sections)
   }
 
-  // Pass 1: trim lines from lowest-priority sections first, keeping at least
-  // a short tail/head in each section before collapsing it further.
+  // Trim lines from lowest-priority sections first while protecting Current state
+  // and Open items. Every step strictly decreases remaining sections, lines,
+  // trim markers, or line length, guaranteeing termination without wiping out
+  // surviving high-priority sections when a short bullet is removed.
   while (current.length > maxChars && sections.length > 0) {
-    const prevLen = current.length
     const ordered = [...sections].sort((a, b) => a.priority - b.priority)
-    const withLines = ordered.find(s => s.lines.length > 0)
-    if (withLines) {
-      if (withLines.lines.length > 1) {
-        if (withLines.keepNewest) withLines.lines.shift()
-        else withLines.lines.pop()
-        withLines.trimmed = true
+    const empty = ordered.find(s => s.lines.length === 0)
+    if (empty) {
+      sections.splice(sections.indexOf(empty), 1)
+      current = renderSections(preamble, sections)
+      continue
+    }
+    const s = ordered[0]
+    if (s.lines.length > 1) {
+      if (s.keepNewest) s.lines.shift()
+      else s.lines.pop()
+      s.trimmed = true
+    } else {
+      const overflow = current.length - maxChars
+      const markerDelta = s.trimmed ? 0 : (s.keepNewest ? '…[older items trimmed]\n'.length : '\n…[trimmed]'.length)
+      const target = s.lines[0].length - overflow - markerDelta - 1
+      if (target >= 24 && target < s.lines[0].length) {
+        s.lines[0] = `${safeSlicePrefix(s.lines[0], target).trimEnd()}…`
+        s.trimmed = true
+      } else if (sections.length > 1) {
+        sections.splice(sections.indexOf(s), 1)
+      } else if (s.trimmed) {
+        // Reclaim trim-marker room on the final surviving section before truncating its text.
+        s.trimmed = false
       } else {
-        const overflow = current.length - maxChars
-        const line = withLines.lines[0]
-        const target = line.length - overflow - 16
-        if (target >= 40) {
-          withLines.lines[0] = `${line.slice(0, target)}…`
-          withLines.trimmed = true
+        const room = maxChars - s.heading.length - 2
+        if (room >= 1 && room < s.lines[0].length) {
+          s.lines[0] = `${safeSlicePrefix(s.lines[0], room).trimEnd()}…`
         } else {
-          withLines.lines.length = 0
-          withLines.trimmed = true
+          break
         }
       }
-    } else {
-      // Every section is down to heading + marker; drop lowest-priority section.
-      const victim = ordered[0]
-      const idx = sections.indexOf(victim)
-      if (idx >= 0) sections.splice(idx, 1)
     }
     current = renderSections(preamble, sections)
-    if (current.length >= prevLen) {
-      // Safety valve: drop lowest-priority section to guarantee strict progress.
-      const victim = [...sections].sort((a, b) => a.priority - b.priority)[0]
-      if (!victim) break
-      sections.splice(sections.indexOf(victim), 1)
-      current = renderSections(preamble, sections)
-    }
   }
 
   if (current.length <= maxChars) return current
-  if (maxChars <= note.length) return current.slice(0, maxChars)
-  return `${current.slice(0, maxChars - note.length).trimEnd()}${note}`
+  if (maxChars <= note.length) return safeSlicePrefix(current, maxChars)
+  return `${safeSlicePrefix(current, maxChars - note.length).trimEnd()}${note}`
 }
 
 export type LedgerUpdate = { ledger: string; requests: number }

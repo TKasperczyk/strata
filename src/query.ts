@@ -5,6 +5,36 @@ import { renderMessage } from './mask.js'
 import { prefixHash, readReady } from './ready.js'
 import type { ArchivedMessage } from './types.js'
 
+function renderArchived(m: ArchivedMessage): string {
+  const parts: string[] = []
+  const body = renderMessage(m, m.seq)
+  if (body) parts.push(body)
+  if (m.media?.length) {
+    parts.push(`#${m.seq} media: ${m.media.map(r => r.path).join(', ')}`)
+  }
+  if (!parts.length) {
+    parts.push(`#${m.seq} ${m.role}: (empty or non-text message)`)
+  }
+  return parts.join('\n')
+}
+
+function adjustSliceBounds(text: string, start: number, end: number): [number, number] {
+  let s = start
+  let e = end
+  if (s > 0 && s < text.length) {
+    const c = text.charCodeAt(s)
+    if (c >= 0xdc00 && c <= 0xdfff) s++
+  }
+  if (e > s && e < text.length) {
+    const c = text.charCodeAt(e - 1)
+    if (c >= 0xd800 && c <= 0xdbff) {
+      // Back off so the next page begins cleanly with the full pair; if that would yield empty slice, include the low surrogate.
+      e = e - 1 > s ? e - 1 : Math.min(text.length, e + 1)
+    }
+  }
+  return [s, e]
+}
+
 export type ShowOptions = {
   from: number
   to?: number
@@ -41,7 +71,7 @@ export function showArchive(dir: string, options: ShowOptions): ShowResult {
       text: ''
     }
   }
-  const full = picked.map(m => renderMessage(m, m.seq)).join('\n\n')
+  const full = picked.map(renderArchived).join('\n\n')
   const offset = Math.max(0, Math.floor(options.offset ?? 0))
   const limit = options.limit !== undefined && options.limit > 0 ? Math.floor(options.limit) : undefined
   if (offset >= full.length) {
@@ -56,18 +86,19 @@ export function showArchive(dir: string, options: ShowOptions): ShowResult {
       text: `[strata show: offset ${offset} is past end of output (${full.length} chars)]`
     }
   }
-  const slice = limit !== undefined ? full.slice(offset, offset + limit) : full.slice(offset)
-  const end = offset + slice.length
+  const rawEnd = limit !== undefined ? Math.min(full.length, offset + limit) : full.length
+  const [sliceStart, end] = adjustSliceBounds(full, offset, rawEnd)
+  const slice = full.slice(sliceStart, end)
   const hasMore = end < full.length
   const footer = hasMore || offset > 0
-    ? `\n\n[strata show: chars ${offset}-${end} of ${full.length}${hasMore ? `; pass offset=${end} to continue` : ' (end)'}]`
+    ? `\n\n[strata show: chars ${sliceStart}-${end} of ${full.length}${hasMore ? `; pass offset=${end} to continue` : ' (end)'}]`
     : ''
   return {
     found: true,
     archiveCount: archive.length,
     seqs: picked.map(m => m.seq),
     totalChars: full.length,
-    offset,
+    offset: sliceStart,
     returnedChars: slice.length,
     hasMore,
     ...(hasMore ? { nextOffset: end } : {}),
@@ -106,8 +137,7 @@ export type SearchResult = {
 
 function makeSnippet(rendered: string, index: number, matchLen: number, contextChars: number): string {
   const half = Math.max(20, Math.floor(contextChars / 2))
-  const start = Math.max(0, index - half)
-  const end = Math.min(rendered.length, index + matchLen + half)
+  const [start, end] = adjustSliceBounds(rendered, Math.max(0, index - half), Math.min(rendered.length, index + matchLen + half))
   const body = rendered.slice(start, end).replace(/\s+/g, ' ').trim()
   return `${start > 0 ? '…' : ''}${body}${end < rendered.length ? '…' : ''}`
 }
@@ -155,7 +185,7 @@ export function searchArchive(dir: string, options: SearchOptions): SearchResult
   const matches: SearchMatch[] = []
   let totalMatches = 0
   for (const m of candidates) {
-    const rendered = renderMessage(m, m.seq)
+    const rendered = renderArchived(m)
     const hit = matcher(rendered)
     if (!hit) continue
     totalMatches++
@@ -183,6 +213,8 @@ export function searchArchive(dir: string, options: SearchOptions): SearchResult
   }
 }
 
+export type ReadyLedgerStatus = 'compatible' | 'pending' | 'stale'
+
 export type SessionStatus = {
   sessionKey: string
   archiveCount: number
@@ -201,6 +233,7 @@ export type SessionStatus = {
     age: number
     preparedAt: string
     compatible: boolean
+    status: ReadyLedgerStatus
   }
 }
 
@@ -214,7 +247,13 @@ export function sessionStatus(dir: string, sessionKey: string): SessionStatus {
   const bySeq = new Map<number, ArchivedMessage>(archive.map(m => [m.seq, m]))
   const rows = state.branch.map(seq => bySeq.get(seq)).filter((m): m is ArchivedMessage => m !== undefined)
   const ready = readReady(dir)
-  const readyCompatible = ready !== undefined && ready.through <= rows.length && prefixHash(rows, ready.through) === ready.prefixHash
+  const readyStatus: ReadyLedgerStatus | undefined = ready
+    ? ready.through > rows.length
+      ? 'pending'
+      : prefixHash(rows, ready.through) === ready.prefixHash
+        ? 'compatible'
+        : 'stale'
+    : undefined
   const ledgerLag = state.lastCut !== undefined ? Math.max(0, state.lastCut - state.ledgerThrough) : 0
 
   return {
@@ -229,14 +268,15 @@ export function sessionStatus(dir: string, sessionKey: string): SessionStatus {
     ledgerChars: state.ledger.length,
     ledgerAge: state.ledgerAge,
     ledgerLag,
-    ...(ready
+    ...(ready && readyStatus
       ? {
           readyLedger: {
             through: ready.through,
             chars: ready.ledger.length,
             age: ready.age,
             preparedAt: ready.preparedAt,
-            compatible: readyCompatible
+            compatible: readyStatus === 'compatible',
+            status: readyStatus
           }
         }
       : {})
@@ -249,7 +289,7 @@ export function formatSessionStatus(s: SessionStatus): string {
     ? `ledger: ${s.ledgerChars.toLocaleString('en-US')} chars, covers ${s.ledgerThrough} rows (age ${s.ledgerAge}${s.ledgerLag > 0 ? `, lags cut by ${s.ledgerLag} rows` : s.lastCut !== undefined ? ', up to date' : ''})`
     : `ledger: empty${s.ledgerLag > 0 ? ` (lags cut by ${s.ledgerLag} rows)` : ''}`
   const readyLine = s.readyLedger
-    ? `ready ledger: ${s.readyLedger.chars.toLocaleString('en-US')} chars, covers ${s.readyLedger.through} rows (${s.readyLedger.compatible ? 'compatible' : 'stale'}, prepared ${s.readyLedger.preparedAt})`
+    ? `ready ledger: ${s.readyLedger.chars.toLocaleString('en-US')} chars, covers ${s.readyLedger.through} rows (${s.readyLedger.status}, prepared ${s.readyLedger.preparedAt})`
     : 'ready ledger: none'
   return [
     `archive: ${s.archiveCount} messages (${kb} KB), ${s.mediaCount} media files, active branch ${s.branchLength} rows`,

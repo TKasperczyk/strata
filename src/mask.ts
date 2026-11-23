@@ -11,8 +11,27 @@ export function messageChars(m: Message): number {
   return n
 }
 
+/** Slice from the start without splitting a UTF-16 surrogate pair at the cut boundary. */
+export function safeSlicePrefix(text: string, max: number): string {
+  if (max <= 0) return ''
+  if (text.length <= max) return text
+  const code = text.charCodeAt(max - 1)
+  return code >= 0xd800 && code <= 0xdbff ? text.slice(0, max - 1) : text.slice(0, max)
+}
+
+/** Slice from the end without splitting a UTF-16 surrogate pair at the cut boundary. */
+export function safeSliceSuffix(text: string, max: number): string {
+  if (max <= 0) return ''
+  if (text.length <= max) return text
+  const start = text.length - max
+  const code = text.charCodeAt(start)
+  return code >= 0xdc00 && code <= 0xdfff ? text.slice(start + 1) : text.slice(start)
+}
+
 function cut(text: string, max: number): string {
-  return text.length <= max ? text : `${text.slice(0, max)}…[+${text.length - max} chars]`
+  if (text.length <= max) return text
+  const prefix = safeSlicePrefix(text, max)
+  return `${prefix}…[+${text.length - prefix.length} chars]`
 }
 
 function cutWithSeq(text: string, max: number, seq: number): string {
@@ -20,9 +39,12 @@ function cutWithSeq(text: string, max: number, seq: number): string {
   if (max < 80) return cut(text, max)
   const head = Math.floor(max * 0.65)
   const tail = max - head
-  const omitted = text.length - head - tail
+  const prefix = safeSlicePrefix(text, head)
+  const suffix = tail > 0 ? safeSliceSuffix(text, tail) : ''
+  const omitted = text.length - prefix.length - suffix.length
+  if (omitted <= 0) return text
   const note = `\n…[strata omitted ${omitted.toLocaleString('en-US')} chars; full text is archive seq ${seq}]…\n`
-  const shortened = `${text.slice(0, head)}${note}${tail > 0 ? text.slice(-tail) : ''}`
+  const shortened = `${prefix}${note}${suffix}`
   return shortened.length < text.length ? shortened : text
 }
 
@@ -46,7 +68,9 @@ export function maskResultText(text: string, isError: boolean, seq: number, conf
   if (keep <= 0) return header
   const head = isError ? Math.floor(keep * 0.5) : Math.floor(keep * 0.6)
   const tail = keep - head
-  const excerpt = `${header}\n${text.slice(0, head)}\n…\n${tail > 0 ? text.slice(-tail) : ''}`
+  const prefix = safeSlicePrefix(text, head)
+  const suffix = tail > 0 ? safeSliceSuffix(text, tail) : ''
+  const excerpt = `${header}\n${prefix}\n…\n${suffix}`
   return excerpt.length < text.length ? excerpt : text
 }
 

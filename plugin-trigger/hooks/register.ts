@@ -43,6 +43,12 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // /clear and /resume fire session.end (never session.start), so reset status here too.
+  on('session.end', (_$, e, next) => {
+    resetStatus()
+    return next(e)
+  })
+
   on('command.run', { command: STATUS_COMMAND }, async $ => {
     const now = await $.clock.now()
     const ago = (at?: number) => (at === undefined ? 'never' : `${Math.round((now - at) / 1000)}s ago`)

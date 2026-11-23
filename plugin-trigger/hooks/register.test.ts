@@ -99,6 +99,37 @@ describe('strata-trigger', () => {
     expect(reset.text).toContain('last outcome: no compaction started yet')
   })
 
+  test('session.end (/clear) resets module-level status and ignores late settlement from prior session', async ($, on) => {
+    recordLogs(on)
+    const clock = mock.clock(on)
+    mock.env(on, { STRATA_TRIGGER_TOKENS: TRIGGER })
+    on('command.register', (_$, e) => ({ value: { command: e.name } }))
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
+    on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
+    on('session.usage', usageAt(5000))
+    let resolvePrior: ((v: typeof BUILT_IN) => void) | undefined
+    on('session.compact', () => new Promise<typeof BUILT_IN>(resolve => { resolvePrior = resolve }))
+    on('turn.complete', () => ({ text: 'done' }))
+
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+    await $.turn.complete(turn())
+    await clock.advance(0)
+    expect((await $.command.run(statusCmd)).text).toContain('compaction in flight since')
+
+    // /clear fires session.end without session.start.
+    await $.session.end({ reason: 'clear', sessionId: 'old-sess', resume: { id: 'old-sess' } })
+    const cleared = await $.command.run(statusCmd)
+    expect(cleared.text).toContain('no compaction in flight')
+    expect(cleared.text).toContain('last turn saw no reading tokens')
+    expect(cleared.text).toContain('last outcome: no compaction started yet')
+
+    // Late settlement from the cleared session must NOT overwrite the fresh session's outcome.
+    resolvePrior?.(BUILT_IN)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect((await $.command.run(statusCmd)).text).toContain('last outcome: no compaction started yet')
+  })
+
   test('surfaces compaction refusals, records them in /strata-status, and retries on the next turn', async ($, on) => {
     const logs = recordLogs(on)
     const clock = mock.clock(on)

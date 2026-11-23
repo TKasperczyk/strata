@@ -1,13 +1,13 @@
 import { execFileSync } from 'child_process'
-import { mkdtempSync, rmSync } from 'fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join, resolve } from 'path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { compact } from '../src/compact.js'
 import { loadConfig, type Config } from '../src/config.js'
 import { formatSessionStatus, searchArchive, sessionStatus, showArchive } from '../src/query.js'
-import { writeReady, prefixHash } from '../src/ready.js'
-import { readArchive } from '../src/archive.js'
+import { writeReady, prefixHash, readReady } from '../src/ready.js'
+import { appendArchive, readArchive } from '../src/archive.js'
 import type { Message } from '../src/types.js'
 
 const SESSION = 'query-sess'
@@ -184,5 +184,97 @@ describe('archive query, search, and status', () => {
     const st = JSON.parse(statusOut)
     expect(st.compactions).toBe(1)
     expect(st.ledgerLag).toBe(0)
+
+    // 7. ledger-save rejects a stale shallower `through` on the same committed branch
+    const arch = readArchive(join(dir, 'sessions', SESSION))
+    const deeper = execFileSync('node', [cliPath, 'ledger-save', '--session', SESSION, '--in', '-'], {
+      input: JSON.stringify({ ledger: '## Current state\n- deep', through: 20, prefixHash: prefixHash(arch, 20), age: 1 }),
+      env,
+      encoding: 'utf-8'
+    })
+    expect(JSON.parse(deeper).saved).toBe(true)
+    const shallower = execFileSync('node', [cliPath, 'ledger-save', '--session', SESSION, '--in', '-'], {
+      input: JSON.stringify({ ledger: '## Current state\n- stale', through: 10, prefixHash: prefixHash(arch, 10), age: 0 }),
+      env,
+      encoding: 'utf-8'
+    })
+    expect(JSON.parse(shallower).saved).toBe(false)
+    expect(readReady(join(dir, 'sessions', SESSION))?.through).toBe(20)
+
+    // 8. leading-dash instructions via `--instructions=...` parse cleanly
+    const dashPlan = execFileSync('node', [cliPath, 'ledger-plan', '--session', SESSION, '--in', '-', '--budget', '2000', '--sync', '--instructions=- keep auth notes'], {
+      input: JSON.stringify({ messages: msgs }),
+      env,
+      encoding: 'utf-8'
+    })
+    expect(JSON.parse(dashPlan).focus).toBe('- keep auth notes')
+  })
+
+  it('shows media-only/empty rows cleanly, never splits emoji surrogate pairs on pagination, and marks pre-compaction ready ledgers pending', () => {
+    const sdir = join(dir, 'sessions', 'media-sess')
+    appendArchive(sdir, [
+      { seq: 0, role: 'user', text: '', toolUses: [], media: [{ path: '/tmp/0-0.png' }] },
+      { seq: 1, role: 'assistant', text: '', toolUses: [] },
+      { seq: 2, role: 'user', text: '🚀'.repeat(40), toolUses: [] }
+    ])
+    const mediaRow = showArchive(sdir, { from: 0 })
+    expect(mediaRow.found).toBe(true)
+    expect(mediaRow.text).toContain('#0 media: /tmp/0-0.png')
+
+    const emptyRow = showArchive(sdir, { from: 1 })
+    expect(emptyRow.found).toBe(true)
+    expect(emptyRow.text).toContain('empty or non-text message')
+
+    // Paginating right through an emoji boundary must not produce lone surrogates.
+    const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
+    let offset = 0
+    let reassembled = ''
+    for (let guard = 0; guard < 50; guard++) {
+      const page = showArchive(sdir, { from: 2, offset, limit: 15 })
+      const body = page.text.split('\n\n[strata show:')[0]
+      expect(body).not.toMatch(loneSurrogate)
+      reassembled += body
+      if (!page.hasMore) break
+      offset = page.nextOffset!
+    }
+    expect(reassembled).toBe(`#2 user: ${'🚀'.repeat(40)}`)
+
+    // Pre-compaction ready ledger (through > committed branch length) reports 'pending', not 'stale'.
+    const pendingDir = join(dir, 'sessions', 'pending-sess')
+    writeReady(pendingDir, { ledger: '## Current state\n- prepped', through: 25, prefixHash: 'live-hash', age: 0, preparedAt: '2026-11-23T00:00:00Z' })
+    const st = sessionStatus(pendingDir, 'pending-sess')
+    expect(st.readyLedger?.status).toBe('pending')
+    expect(formatSessionStatus(st)).toContain('(pending, prepared')
+  })
+
+  it('CLI replay --background --no-llm handles multi-compaction transcripts and prepare declines gracefully', () => {
+    const cliPath = resolve('dist/cli.js')
+    const transcript = join(dir, 'sample.jsonl')
+    const lines: string[] = []
+    for (let n = 0; n < 25; n++) {
+      lines.push(JSON.stringify({ type: 'user', message: { role: 'user', content: `step ${n}: inspect module ${n}` } }))
+      lines.push(JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: '', signature: 's'.repeat(1_200) },
+            { type: 'tool_use', id: `u${n}`, name: 'Read', input: { file_path: `/src/m${n}.ts` } }
+          ]
+        }
+      }))
+      lines.push(JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `u${n}`, content: 'C'.repeat(4_000) }] }
+      }))
+      lines.push(JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: `Finished step ${n}.` } }))
+    }
+    writeFileSync(transcript, lines.join('\n') + '\n')
+    const out = execFileSync('node', [cliPath, 'replay', transcript, '--budget', '4000', '--trigger', '8000', '--no-llm', '--background'], {
+      encoding: 'utf-8'
+    })
+    expect(out).toContain('prepare at')
+    expect(out).toContain('#1 archived')
+    expect(out).toContain('end: live')
   })
 })

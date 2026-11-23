@@ -176,6 +176,46 @@ describe('hiddenByRow', () => {
     expect(hidden.get(0)?.images).toHaveLength(1)
     expect(hidden.get(2)?.thinkingChars).toBe(1200)
   })
+
+  it('attaches images to contiguous image-only prompt rows after a text prompt', () => {
+    const rows = [user('first prompt'), user(''), user('third prompt'), answer('ok')]
+    const api: ApiMessage[] = [
+      { role: 'user', content: [{ type: 'text', text: 'first prompt' }, image(png(500, 500)), { type: 'text', text: 'third prompt' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'ok' }] }
+    ]
+    const hidden = hiddenByRow(rows, api)
+    expect(hidden.get(0)).toBeUndefined()
+    expect(hidden.get(1)?.images).toHaveLength(1)
+    expect(hidden.get(2)).toBeUndefined()
+
+    // Trailing image-only prompt at end of merged user message:
+    const rows2 = [user('first prompt'), user(''), answer('ok')]
+    const api2: ApiMessage[] = [
+      { role: 'user', content: [{ type: 'text', text: 'first prompt' }, image(png(400, 400))] },
+      { role: 'assistant', content: [{ type: 'text', text: 'ok' }] }
+    ]
+    const hidden2 = hiddenByRow(rows2, api2)
+    expect(hidden2.get(0)).toBeUndefined()
+    expect(hidden2.get(1)?.images).toHaveLength(1)
+  })
+
+  it('advances cursor past a consumed multi-text-block assistant row before a repeated text block', () => {
+    const rows = [answer('step 1\nok'), answer('ok')]
+    const api: ApiMessage[] = [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'step 1' },
+          { type: 'text', text: 'ok' },
+          { type: 'thinking', thinking: '', signature: 'Z'.repeat(40_000) },
+          { type: 'text', text: 'ok' }
+        ]
+      }
+    ]
+    const hidden = hiddenByRow(rows, api)
+    expect(hidden.get(0)).toBeUndefined()
+    expect(hidden.get(1)?.thinkingChars).toBe(40_000)
+  })
 })
 
 describe('third-pass regressions (weights)', () => {
@@ -273,6 +313,25 @@ describe('thinkingRatio and textCharsPerToken calibration', () => {
     const cpt = textCharsPerToken(rows, hidden, { tokens: 105_000, overhead: 5_000 })
     expect(cpt).toBeCloseTo(2.5, 1)
     expect(textCharsPerToken(rows, hidden, undefined)).toBe(CHARS_PER_TOKEN)
+  })
+
+  it('clamps smoothly to upper bounds on extreme negative residuals instead of jumping back to defaults', () => {
+    const rows = [user('x'.repeat(100_000)), thinkingRow(), call('c0'), result('c0', 'ok'), answer('done')]
+    const api: ApiMessage[] = [
+      { role: 'user', content: [{ type: 'text', text: rows[0].text }] },
+      { role: 'assistant', content: [{ type: 'thinking', thinking: '', signature: 's'.repeat(400_000) }, { type: 'tool_use', id: 'c0', name: 'Read', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'c0', content: 'ok' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'done' }] }
+    ]
+    const hidden = hiddenByRow(rows, api)
+    // Extreme negative residual pushes thinkingTokens <= 0 -> must clamp at upper bound 8 (not jump back to default 4).
+    const cal = calibrateWeights(rows, hidden, { tokens: 10_000, overhead: 5_000 })
+    expect(cal.thinkingRatio).toBe(8)
+    expect(cal.charsPerToken).toBeGreaterThan(CHARS_PER_TOKEN)
+
+    // Without thinking, extreme negative residual pushes text density to upper bound 5 (not default 3.5).
+    const textOnlyCal = calibrateWeights([user('x'.repeat(100_000)), answer('done')], new Map(), { tokens: 6_000, overhead: 5_000 })
+    expect(textOnlyCal.charsPerToken).toBe(5)
   })
 })
 

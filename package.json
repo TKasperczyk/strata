@@ -1,6 +1,6 @@
 {
   "name": "strata",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Layered, budget-bounded compaction for Claude Code: archive everything, rebuild context from the raw history every time",
   "type": "module",
   "bin": {

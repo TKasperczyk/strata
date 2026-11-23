@@ -149,15 +149,18 @@ describe('strataCompact', () => {
     expect(models).toHaveLength(0)
     expect(calls.some(c => c.argv.includes('ledger-plan'))).toBe(false)
 
-    await strataCompact(engine, { trigger: 'manual', instructions: 'focus on db', messages: MESSAGES }, builtIn, SESSION)
+    await strataCompact(engine, { trigger: 'manual', instructions: '- focus on db', messages: MESSAGES }, builtIn, SESSION)
     expect(models).toHaveLength(1)
     expect(models[0]?.model).toBe('sonnet')
     expect(models[0]?.prompt).toContain('focus on db')
     const planCall = calls.find(c => c.argv.includes('ledger-plan'))
     expect(planCall?.argv).toContain('--sync')
-    expect(planCall?.argv).toContain('focus on db')
+    expect(planCall?.argv).toContain('--instructions=- focus on db')
+    expect(JSON.parse(planCall?.stdin ?? '{}').instructions).toBe('- focus on db')
     const compactCalls = calls.filter(c => c.argv.includes('compact'))
     const sent = JSON.parse(compactCalls[1]?.stdin ?? '{}')
+    expect(compactCalls[1]?.argv).toContain('--instructions=- focus on db')
+    expect(sent.instructions).toBe('- focus on db')
     expect(sent.preparedLedger).toEqual({
       ledger: '## Current state\n- folded (#0)',
       through: 2,
@@ -351,5 +354,69 @@ describe('strataCompact', () => {
     expect(status.text).toContain('compactions: 3')
     expect(status.text).toContain('lags cut by 2 rows')
     expect(status.text).toContain('ready ledger: 1,300 chars')
+
+    // tool.call validation errors return structured error results without invoking CLI
+    const runsBeforeErr = runs.length
+    const badRange = await $.tool.call({ tool: 'mcp__strata__show', seq: 10, last_seq: 5 })
+    expect(badRange.isError).toBe(true)
+    expect(String(badRange.result)).toContain('last_seq (5) must be >= seq (10)')
+    const badQuery = await $.tool.call({ tool: 'mcp__strata__search', query: '' })
+    expect(badQuery.isError).toBe(true)
+    expect(runs.length).toBe(runsBeforeErr)
+  })
+
+  test('session.end (/clear) cancels queued background prep and resets pending state', async ($, on) => {
+    const clock = mock.clock(on)
+    mock.env(on, { STRATA_TRIGGER_TOKENS: '1000' })
+    const runs: Call[] = []
+    on('session.usage', () => ({ value: { startedAt: 0, context: { ...BREAKDOWN, tokens: 800, percent: 1 } as never, rateLimits: [] } }))
+    on('session.id', () => ({ value: SESSION }))
+    on('session.messages', (_$, e) => ({ value: e?.as === 'api' ? API_FORM : MESSAGES }))
+    on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
+    on('process.run', (_$, e) => {
+      runs.push({ argv: [...e.argv], stdin: e.init?.stdin })
+      return { value: cli('{}') }
+    })
+    on('ui.log', () => ({ value: undefined }))
+    on('turn.complete', () => ({ text: 'done' }))
+
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+    // User runs /clear before the queued timer fires.
+    await $.session.end({ reason: 'clear', sessionId: SESSION, resume: { id: SESSION } })
+    await clock.advance(0)
+    expect(runs).toHaveLength(0)
+  })
+
+  test('multi-chunk ledger execution trims oversized intermediate output section-aware, keeping Current state and Open items', async () => {
+    const calls: Call[] = []
+    const models: ModelCompleteRequest[] = []
+    const stdout = JSON.stringify({ entries: [{ keep: 2 }], stats: { rawChars: 7000, outputChars: 3500, matched: 0, previousOutput: 0, cut: 2, ledgerThrough: 2 } })
+    const bigChunk1 = [
+      '## Dead ends',
+      ...Array.from({ length: 40 }, (_, i) => `- Old dead end ${i} ${'d'.repeat(40)} (#${i})`),
+      '',
+      '## Current state',
+      '- CRITICAL_STATE_ALIVE (#50)',
+      '',
+      '## Open items',
+      '- CRITICAL_TODO_ALIVE (#51)'
+    ].join('\n')
+    let callIdx = 0
+    const engine = fakeEngine(cli(stdout), calls, [], models, {
+      onRun: argv =>
+        argv.includes('ledger-plan')
+          ? cli(JSON.stringify({ ...SAMPLE_PLAN, maxChars: 200, chunks: ['chunk-1', 'chunk-2'] }))
+          : cli(stdout),
+      onModel: () => {
+        callIdx++
+        return { isAnswered: true as const, text: callIdx === 1 ? bigChunk1 : '## Current state\n- final (#50)', usage: ZERO_USAGE }
+      }
+    })
+    await strataCompact(engine, { trigger: 'manual', messages: MESSAGES }, builtIn, SESSION)
+    expect(models).toHaveLength(2)
+    // Chunk 2's prompt must still contain Current state and Open items (not chopped off by raw slice!).
+    expect(models[1]?.prompt).toContain('CRITICAL_STATE_ALIVE')
+    expect(models[1]?.prompt).toContain('CRITICAL_TODO_ALIVE')
+    expect(models[1]?.prompt).not.toContain('Old dead end 0 ')
   })
 })

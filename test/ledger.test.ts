@@ -39,6 +39,18 @@ describe('ledger rendering and helpers', () => {
       toolUses: []
     }))
     expect(ledgerRequests(span, smallChunkCfg)).toBeGreaterThan(2)
+
+    // Single message with many large results must still split cleanly under ledgerChunkChars.
+    const multiResultMsg: ArchivedMessage = {
+      seq: 0,
+      role: 'user',
+      text: '',
+      toolUses: [],
+      toolResults: Array.from({ length: 10 }, (_, i) => ({ tool_use_id: `r${i}`, text: 'E'.repeat(5_000), isError: true }))
+    }
+    const splitChunks = renderSpan([multiResultMsg], loadConfig({ ledgerChunkChars: 10_000 }))
+    expect(splitChunks.length).toBeGreaterThanOrEqual(5)
+    for (const c of splitChunks) expect(c.length).toBeLessThanOrEqual(10_000)
   })
 
   it('trimLedger preserves Current state and Open items when over budget', () => {
@@ -93,6 +105,25 @@ describe('ledger rendering and helpers', () => {
     const tiny = trimLedger(structured, 80)
     expect(tiny.length).toBeLessThanOrEqual(80)
     expect(tiny).toContain('IMPORTANT_STATE')
+
+    // Dropping a short bullet (shorter than the trim marker) in Current state must never wipe out the section!
+    const shortBullet = [
+      '## Current state',
+      '- ok',
+      '',
+      '- Branch feat/sqlite passes 42/42 unit tests (#40)',
+      '- Migration script verified on 3 production transcripts (#41)'
+    ].join('\n')
+    const kept = trimLedger(shortBullet, 110)
+    expect(kept.length).toBeLessThanOrEqual(110)
+    expect(kept).toContain('## Current state')
+    expect(kept).toContain('Migration script verified')
+
+    // Never splits UTF-16 surrogate pairs (emoji) when truncating.
+    const emojiLedger = `## Current state\n- ${'🚀'.repeat(80)}`
+    const cutEmoji = trimLedger(emojiLedger, 71)
+    expect(cutEmoji.length).toBeLessThanOrEqual(71)
+    expect(cutEmoji).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/)
   })
 
   it('resolves standalone model aliases and builds prompts with focus instructions', () => {

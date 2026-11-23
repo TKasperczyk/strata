@@ -116,15 +116,21 @@ function emptyHidden(): Hidden {
 }
 
 /**
- * Match an API text block against a SessionMessage's `text`. Multiple text
- * blocks on one row are joined with `\n` in SessionMessage.text, so a block
- * matches either the whole trimmed text or a line-bounded segment within it.
+ * Match an API text block against a SessionMessage's `text` starting at
+ * `fromOffset`. Multiple text blocks on one row are joined with `\n` in
+ * SessionMessage.text, so a block matches either the whole trimmed text or a
+ * line-bounded segment within it. Returns the next offset within the row and
+ * whether the row's text has now been fully consumed.
  */
-function hasTextBlock(rowText: string, blockText: string): boolean {
+function matchTextBlock(
+  rowText: string,
+  blockText: string,
+  fromOffset = 0
+): { end: number; consumedAll: boolean } | undefined {
   const trimmed = rowText.trim()
-  if (trimmed === blockText) return true
-  if (!trimmed.includes('\n')) return false
-  let idx = trimmed.indexOf(blockText)
+  if (fromOffset === 0 && trimmed === blockText) return { end: trimmed.length, consumedAll: true }
+  if (!trimmed.includes('\n')) return undefined
+  let idx = trimmed.indexOf(blockText, fromOffset)
   while (idx !== -1) {
     let start = idx
     while (start > 0 && trimmed[start - 1] !== '\n' && (trimmed[start - 1] === ' ' || trimmed[start - 1] === '\t' || trimmed[start - 1] === '\r')) start--
@@ -132,10 +138,13 @@ function hasTextBlock(rowText: string, blockText: string): boolean {
     let end = idx + blockText.length
     while (end < trimmed.length && trimmed[end] !== '\n' && (trimmed[end] === ' ' || trimmed[end] === '\t' || trimmed[end] === '\r')) end++
     const endOk = end === trimmed.length || trimmed[end] === '\n'
-    if (startOk && endOk) return true
+    if (startOk && endOk) {
+      const next = end < trimmed.length && trimmed[end] === '\n' ? end + 1 : end
+      return { end: next, consumedAll: next >= trimmed.length }
+    }
     idx = trimmed.indexOf(blockText, idx + 1)
   }
-  return false
+  return undefined
 }
 
 function isEmptyPrompt(m: Message): boolean {
@@ -168,15 +177,32 @@ export function hiddenByRow(input: Message[], api: ApiMessage[]): Map<number, Hi
     for (const u of m.toolUses) callRow.set(u.tool_use_id, i)
     for (const r of m.toolResults ?? []) resultRow.set(r.tool_use_id, i)
   })
-  // Rows are in conversation order; searching forward from the last match keeps repeats apart.
+  // Rows are in conversation order; searching forward from (cursor, cursorOffset) keeps repeats apart
+  // and lets multi-text-block rows advance cleanly once their final block is matched.
   let cursor = 0
+  let cursorOffset = 0
+  const advanceCursor = (row: number, offset = 0) => {
+    if (row > cursor) {
+      cursor = row
+      cursorOffset = offset
+    } else if (row === cursor && offset > cursorOffset) {
+      cursorOffset = offset
+    }
+  }
   const findForward = (test: (m: Message) => boolean, from = cursor): number | undefined => {
     for (let i = from; i < input.length; i++) if (test(input[i])) return i
     return undefined
   }
-
-  const assistantRowWithText = (text: string) => findForward(m => m.role === 'assistant' && hasTextBlock(m.text, text))
-  const promptRowWithText = (text: string) => findForward(m => m.role === 'user' && !m.toolResults?.length && hasTextBlock(m.text, text))
+  const findTextMatch = (role: 'user' | 'assistant', text: string) => {
+    for (let i = cursor; i < input.length; i++) {
+      const m = input[i]
+      if (m.role !== role) continue
+      if (role === 'user' && m.toolResults?.length) continue
+      const match = matchTextBlock(m.text, text, i === cursor ? cursorOffset : 0)
+      if (match) return { row: i, ...match }
+    }
+    return undefined
+  }
 
   for (const message of api) {
     if (message.role === 'assistant') {
@@ -188,16 +214,18 @@ export function hiddenByRow(input: Message[], api: ApiMessage[]): Map<number, Hi
       for (const block of message.content) {
         pending += thinkingChars(block)
         let row: number | undefined
-        let advancePast = false
         if (block.type === 'tool_use') {
           row = callRow.get(String(block.id))
+          if (row !== undefined) advanceCursor(row)
         } else if (block.type === 'text' && String(block.text ?? '').trim()) {
           const text = String(block.text).trim()
-          row = assistantRowWithText(text)
-          if (row !== undefined && input[row].text.trim() === text) advancePast = true
+          const hit = findTextMatch('assistant', text)
+          if (hit) {
+            row = hit.row
+            advanceCursor(hit.consumedAll ? hit.row + 1 : hit.row, hit.consumedAll ? 0 : hit.end)
+          }
         }
         if (row === undefined) continue
-        cursor = Math.max(cursor, advancePast ? row + 1 : row)
         last = row
         if (pending) at(row).thinkingChars += pending
         pending = 0
@@ -211,18 +239,38 @@ export function hiddenByRow(input: Message[], api: ApiMessage[]): Map<number, Hi
     }
 
     // Consecutive prompts merge into one message. Images may either follow their
-    // prompt's text ([text, image]) or precede it ([image, text]), or appear
-    // alone on image-only user rows ([image]). Buffer leading images until a text
-    // block reveals whether empty-text prompt rows preceded it or the images
-    // belong to that prompt itself.
+    // prompt's text ([text, image]), precede it ([image, text]), or appear alone
+    // on image-only user rows ([image]). Buffer images until boundaries reveal
+    // whether contiguous empty-text prompt rows own them.
     let promptAnchor: number | undefined
     const pendingImages: ImageRef[] = []
+    const afterAnchorImages: ImageRef[] = []
+    const flushAfterAnchor = (limit: number) => {
+      if (promptAnchor === undefined || !afterAnchorImages.length) return
+      const emptyAfter: number[] = []
+      for (let k = promptAnchor + 1; k < limit && isEmptyPrompt(input[k]); k++) emptyAfter.push(k)
+      if (!emptyAfter.length) {
+        for (const ref of afterAnchorImages) attachImage(promptAnchor, ref)
+      } else if (afterAnchorImages.length <= emptyAfter.length) {
+        afterAnchorImages.forEach((ref, idx) => attachImage(emptyAfter[idx], ref))
+        advanceCursor(emptyAfter[afterAnchorImages.length - 1] + 1)
+      } else {
+        const forAnchor = afterAnchorImages.length - emptyAfter.length
+        for (let i = 0; i < forAnchor; i++) attachImage(promptAnchor, afterAnchorImages[i])
+        emptyAfter.forEach((emptyRow, idx) => attachImage(emptyRow, afterAnchorImages[forAnchor + idx]))
+        advanceCursor(emptyAfter[emptyAfter.length - 1] + 1)
+      }
+      afterAnchorImages.length = 0
+    }
+
     for (const block of message.content) {
       if (block.type === 'tool_result') {
         const id = String(block.tool_use_id)
         const row = resultRow.get(id)
         if (row === undefined) continue
-        cursor = Math.max(cursor, row)
+        flushAfterAnchor(row)
+        promptAnchor = undefined
+        advanceCursor(row)
         const content = Array.isArray(block.content) ? (block.content as ApiBlock[]) : []
         for (const inner of content) {
           const ref = imageRef(inner, id)
@@ -230,29 +278,37 @@ export function hiddenByRow(input: Message[], api: ApiMessage[]): Map<number, Hi
         }
       } else if (block.type === 'text') {
         const text = String(block.text ?? '').trim()
-        const row = text ? promptRowWithText(text) : undefined
-        if (row !== undefined) {
+        const hit = text ? findTextMatch('user', text) : undefined
+        if (hit) {
           if (pendingImages.length) {
             const emptyBefore: number[] = []
-            for (let k = row - 1; k >= cursor && isEmptyPrompt(input[k]); k--) emptyBefore.unshift(k)
+            for (let k = hit.row - 1; k >= cursor && isEmptyPrompt(input[k]); k--) emptyBefore.unshift(k)
             if (emptyBefore.length) {
               pendingImages.forEach((ref, idx) => attachImage(emptyBefore[Math.min(idx, emptyBefore.length - 1)], ref))
             } else {
-              for (const ref of pendingImages) attachImage(row, ref)
+              for (const ref of pendingImages) attachImage(hit.row, ref)
             }
             pendingImages.length = 0
           }
-          promptAnchor = row
-          const exact = input[row].text.trim() === text
-          cursor = Math.max(cursor, exact ? row + 1 : row)
+          if (promptAnchor !== undefined && afterAnchorImages.length) {
+            if (hit.row === promptAnchor) {
+              for (const ref of afterAnchorImages) attachImage(promptAnchor, ref)
+              afterAnchorImages.length = 0
+            } else {
+              flushAfterAnchor(hit.row)
+            }
+          }
+          promptAnchor = hit.row
+          advanceCursor(hit.consumedAll ? hit.row + 1 : hit.row, hit.consumedAll ? 0 : hit.end)
         }
       } else if (block.type === 'image') {
         const ref = imageRef(block)
         if (!ref) continue
-        if (promptAnchor !== undefined) attachImage(promptAnchor, ref)
+        if (promptAnchor !== undefined) afterAnchorImages.push(ref)
         else pendingImages.push(ref)
       }
     }
+    flushAfterAnchor(input.length)
     if (pendingImages.length) {
       const firstEmpty = findForward(isEmptyPrompt)
       if (firstEmpty !== undefined) {
@@ -261,7 +317,7 @@ export function hiddenByRow(input: Message[], api: ApiMessage[]): Map<number, Hi
           emptyRows.push(k)
         }
         pendingImages.forEach((ref, idx) => attachImage(emptyRows[Math.min(idx, emptyRows.length - 1)], ref))
-        cursor = Math.max(cursor, emptyRows[emptyRows.length - 1] + 1)
+        advanceCursor(emptyRows[emptyRows.length - 1] + 1)
       }
     }
   }
@@ -313,17 +369,19 @@ export function calibrateWeights(input: Message[], hidden: Map<number, Hidden>, 
   let calibratedThinking = DEFAULT_THINKING_CHARS_PER_TOKEN
   if (thinking > 0) {
     const thinkingTokens = thinkingEst + residual * (vThink / vTotal)
-    if (thinkingTokens > 0) {
-      calibratedThinking = Math.min(RATIO_BOUNDS[1], Math.max(RATIO_BOUNDS[0], thinking / thinkingTokens))
-    }
+    calibratedThinking =
+      thinkingTokens > 0
+        ? Math.min(RATIO_BOUNDS[1], Math.max(RATIO_BOUNDS[0], thinking / thinkingTokens))
+        : RATIO_BOUNDS[1]
   }
 
   let calibratedText = CHARS_PER_TOKEN
   if (textChars >= 1_000) {
     const textTokens = textEst + residual * (vText / vTotal)
-    if (textTokens > 0) {
-      calibratedText = Math.min(TEXT_RATIO_BOUNDS[1], Math.max(TEXT_RATIO_BOUNDS[0], textChars / textTokens))
-    }
+    calibratedText =
+      textTokens > 0
+        ? Math.min(TEXT_RATIO_BOUNDS[1], Math.max(TEXT_RATIO_BOUNDS[0], textChars / textTokens))
+        : TEXT_RATIO_BOUNDS[1]
   }
 
   return { thinkingRatio: calibratedThinking, charsPerToken: calibratedText }

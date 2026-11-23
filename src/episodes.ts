@@ -1,3 +1,4 @@
+import { safeSlicePrefix, safeSliceSuffix } from './mask.js'
 import type { ArchivedMessage } from './types.js'
 
 /** One user-prompted stretch of work, or several merged once the index overflows. */
@@ -33,16 +34,18 @@ const LINE_CHARS = 600
 const PROMPT_CHARS = 140
 const OUTCOME_CHARS = 160
 const DEFAULT_PROTECT_RECENT = 4
-const ERROR_LINE_RE = /\b(error|failed|fail|exception|panic|fatal|denied|not found|exit code|enoent|eexist|eacces|typeerror|syntaxerror|referenceerror)\b/i
+const SPECIFIC_ERROR_RE = /\b(error|failed|fail|exception|panic|fatal|denied|not found|enoent|eexist|eacces|econnrefused|typeerror|syntaxerror|referenceerror|assertionerror)\b/i
+const GENERIC_EXIT_RE = /^(command\s+(failed|exited)\b.*|exit\s+code\s+\d+\b.*|exited\s+with\s+(code|status)\s+\d+\b.*)$/i
+const FALLBACK_ERROR_RE = /\b(exit code|exited with)\b/i
 
 function oneLine(text: string, max: number): string {
   const flat = text.replace(/\s+/g, ' ').trim()
-  return flat.length <= max ? flat : `${flat.slice(0, max)}…`
+  return flat.length <= max ? flat : `${safeSlicePrefix(flat, max)}…`
 }
 
 /** Keep the tail of a long path: the file name is the useful part. */
 function shortPath(path: string): string {
-  return path.length <= PATH_CHARS ? path : `…${path.slice(-(PATH_CHARS - 1))}`
+  return path.length <= PATH_CHARS ? path : `…${safeSliceSuffix(path, PATH_CHARS - 1)}`
 }
 
 function compactCommand(raw: string): string {
@@ -56,9 +59,17 @@ function compactErrorHint(raw: string): string {
   if (!lines.length) return ''
   let picked: string | undefined
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (ERROR_LINE_RE.test(lines[i])) {
+    if (SPECIFIC_ERROR_RE.test(lines[i]) && !GENERIC_EXIT_RE.test(lines[i])) {
       picked = lines[i]
       break
+    }
+  }
+  if (!picked) {
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (FALLBACK_ERROR_RE.test(lines[i])) {
+        picked = lines[i]
+        break
+      }
     }
   }
   return oneLine(picked ?? lines[0], ERROR_HINT_CHARS)
@@ -157,6 +168,7 @@ export function renderEpisode(e: Episode): string {
  * never in what the archive holds.
  */
 export function renderIndex(episodes: Episode[], maxChars: number, options: RenderIndexOptions = {}): string {
+  if (maxChars <= 0 || episodes.length === 0) return ''
   const list = [...episodes]
   const protectRecent = options.protectRecent ?? DEFAULT_PROTECT_RECENT
   const recentSeq = protectRecent > 0 && episodes.length > protectRecent ? episodes[episodes.length - protectRecent].first : undefined
@@ -166,8 +178,8 @@ export function renderIndex(episodes: Episode[], maxChars: number, options: Rend
     return 0
   }
 
-  const lengths = list.map(e => renderEpisode(e).length + 1)
-  let total = lengths.reduce((a, b) => a + b, 0)
+  const lengths = list.map(e => renderEpisode(e).length)
+  let total = lengths.reduce((a, b) => a + b, 0) + Math.max(0, list.length - 1)
   while (list.length > 1 && total > maxChars) {
     let best = 0
     let bestTier = Math.max(tier(list[0]), tier(list[1]))
@@ -182,12 +194,14 @@ export function renderIndex(episodes: Episode[], maxChars: number, options: Rend
       }
     }
     const merged = merge(list[best], list[best + 1])
-    const length = renderEpisode(merged).length + 1
-    total += length - lengths[best] - lengths[best + 1]
+    const length = renderEpisode(merged).length
+    // Replacing two lines separated by a newline with one line saves 1 newline too.
+    total += length - lengths[best] - lengths[best + 1] - 1
     list.splice(best, 2, merged)
     lengths.splice(best, 2, length)
   }
   // A single merged line can still overflow a tiny allowance: the cap is hard.
   const index = list.map(renderEpisode).join('\n')
-  return index.length <= maxChars ? index : `${index.slice(0, Math.max(0, maxChars - 1))}…`
+  if (index.length <= maxChars) return index
+  return maxChars === 1 ? '…' : `${safeSlicePrefix(index, maxChars - 1)}…`
 }

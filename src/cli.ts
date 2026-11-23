@@ -3,16 +3,16 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { basename, join, resolve } from 'path'
 import { parseArgs } from 'util'
-import { sessionDir } from './archive.js'
+import { readArchive, readState, sessionDir } from './archive.js'
 import { compact, DeclineError, planLedger, prepare, type CompactStats, type LedgerFn, type PreparedLedger } from './compact.js'
 import { estimateTokens, loadConfig, shareChars } from './config.js'
 import { trimLedger } from './ledger.js'
 import { messageChars } from './mask.js'
 import { formatSessionStatus, searchArchive, sessionStatus, showArchive } from './query.js'
-import { readReady, writeReady } from './ready.js'
+import { prefixHash, readReady, writeReady } from './ready.js'
 import { apiForm, readTranscriptWithBlocks } from './transcript.js'
 import { DEFAULT_THINKING_CHARS_PER_TOKEN, hiddenByRow, type ApiMessage, type UsageReading } from './weights.js'
-import type { Message } from './types.js'
+import type { ArchivedMessage, Message } from './types.js'
 
 const USAGE = `strata - layered, budget-bounded compaction for Claude Code
 
@@ -77,16 +77,18 @@ async function runCompact(argv: string[]): Promise<void> {
   // `-` reads stdin / writes stdout, which is how the plugin calls it.
   const payload = readJsonInput<{
     messages: Message[]
+    instructions?: string
     api?: ApiMessage[]
     usage?: UsageReading
     preparedLedger?: PreparedLedger
     ledgerError?: string
   }>(values.in)
+  const instructions = values.instructions ?? payload.instructions
   const result = await compact(
     {
       sessionKey: values.session,
       messages: payload.messages,
-      ...(values.instructions ? { instructions: values.instructions } : {}),
+      ...(instructions ? { instructions } : {}),
       ...(values.ledger ? { ledgerMode: values.ledger } : {}),
       ...(values['native-tools'] ? { hasNativeTools: true } : {}),
       ...(payload.api ? { api: payload.api } : {}),
@@ -125,14 +127,20 @@ async function runPrepare(argv: string[]): Promise<void> {
     process.stdout.write(`${JSON.stringify(result)}\n`)
     return
   }
-  const { messages, api, usage } = readJsonInput<{ messages: Message[]; api?: ApiMessage[]; usage?: UsageReading }>(values.in!)
+  const { messages, instructions: bodyInstructions, api, usage } = readJsonInput<{
+    messages: Message[]
+    instructions?: string
+    api?: ApiMessage[]
+    usage?: UsageReading
+  }>(values.in!)
+  const instructions = values.instructions ?? bodyInstructions
   const result = await prepare(
     {
       sessionKey: values.session,
       messages,
       ...(api ? { api } : {}),
       ...(usage ? { usage } : {}),
-      ...(values.instructions ? { instructions: values.instructions } : {}),
+      ...(instructions ? { instructions } : {}),
       showCommand: SHOW_COMMAND(values.session)
     },
     config
@@ -166,14 +174,20 @@ function runLedgerPlan(argv: string[]): void {
     process.stdout.write(`${JSON.stringify(plan)}\n`)
     return
   }
-  const { messages, api, usage } = readJsonInput<{ messages: Message[]; api?: ApiMessage[]; usage?: UsageReading }>(values.in!)
+  const { messages, instructions: bodyInstructions, api, usage } = readJsonInput<{
+    messages: Message[]
+    instructions?: string
+    api?: ApiMessage[]
+    usage?: UsageReading
+  }>(values.in!)
+  const instructions = values.instructions ?? bodyInstructions
   const plan = planLedger(
     {
       sessionKey: values.session,
       messages,
       ...(api ? { api } : {}),
       ...(usage ? { usage } : {}),
-      ...(values.instructions ? { instructions: values.instructions } : {}),
+      ...(instructions ? { instructions } : {}),
       showCommand: SHOW_COMMAND(values.session)
     },
     config,
@@ -203,6 +217,23 @@ function runLedgerSave(argv: string[]): void {
   if (existing && existing.prefixHash === payload.prefixHash && existing.through >= payload.through) {
     process.stdout.write(`${JSON.stringify({ saved: false, reason: 'already saved for this prefix', through: existing.through })}\n`)
     return
+  }
+  if (existing && existing.through > payload.through) {
+    const state = readState(dir)
+    if (state.branch.length >= existing.through) {
+      const archive = readArchive(dir)
+      const bySeq = new Map<number, ArchivedMessage>(archive.map(m => [m.seq, m]))
+      const rows = state.branch.map(seq => bySeq.get(seq)).filter((m): m is ArchivedMessage => m !== undefined)
+      if (
+        existing.through <= rows.length &&
+        prefixHash(rows, existing.through) === existing.prefixHash &&
+        payload.through <= rows.length &&
+        prefixHash(rows, payload.through) === payload.prefixHash
+      ) {
+        process.stdout.write(`${JSON.stringify({ saved: false, reason: 'existing ready ledger covers further on this branch', through: existing.through })}\n`)
+        return
+      }
+    }
   }
   writeReady(dir, {
     ledger: trimLedger(payload.ledger, shareChars(config, 'ledger')),
@@ -320,70 +351,78 @@ async function runReplay(argv: string[]): Promise<void> {
   const path = positionals[0]
   if (!path) fail('replay needs a transcript path')
   const dataDir = mkdtempSync(join(tmpdir(), 'strata-replay-'))
-  const config = loadConfig({ dataDir, ...budgetOverride(values.budget) })
-  const trigger = values.trigger ? parseIntArg('--trigger', values.trigger, 1)! : config.budgetTokens * 2
-  const key = `replay-${basename(path, '.jsonl')}`
-  const { messages: raw, blocks } = readTranscriptWithBlocks(path)
-  // Live size as the engine would count it: text plus the images and thinking the rows hide,
-  // computed once per message (rows strata built carry none).
-  const weight = new Map<Message, number>()
-  const tokensOf = (m: Message) => {
-    let w = weight.get(m)
-    if (w === undefined) {
-      const hidden = hiddenByRow([m], apiForm([m], blocks)).get(0)
-      w = estimateTokens(messageChars(m)) + (hidden ? hidden.imageTokens + Math.round(hidden.thinkingChars / DEFAULT_THINKING_CHARS_PER_TOKEN) : 0)
-      weight.set(m, w)
+  try {
+    const config = loadConfig({ dataDir, ...budgetOverride(values.budget) })
+    const trigger = values.trigger ? parseIntArg('--trigger', values.trigger, 1)! : config.budgetTokens * 2
+    const key = `replay-${basename(path, '.jsonl')}`
+    const { messages: raw, blocks } = readTranscriptWithBlocks(path)
+    // Live size as the engine would count it: text plus the images and thinking the rows hide,
+    // computed once per message (rows strata built carry none).
+    const weight = new Map<Message, number>()
+    const tokensOf = (m: Message) => {
+      let w = weight.get(m)
+      if (w === undefined) {
+        const hidden = hiddenByRow([m], apiForm([m], blocks)).get(0)
+        w = estimateTokens(messageChars(m)) + (hidden ? hidden.imageTokens + Math.round(hidden.thinkingChars / DEFAULT_THINKING_CHARS_PER_TOKEN) : 0)
+        weight.set(m, w)
+      }
+      return w
     }
-    return w
-  }
-  const tokens = (ms: Message[]) => ms.reduce((n, m) => n + tokensOf(m), 0)
+    const tokens = (ms: Message[]) => ms.reduce((n, m) => n + tokensOf(m), 0)
 
-  process.stdout.write(`${raw.length} messages, ${tokens(raw).toLocaleString('en-US')} est. tokens raw; budget ${config.budgetTokens}, trigger ${trigger}\n`)
-  const ledgerFn = values['no-llm'] ? noLedger : undefined
-  const PREPARE_HEADROOM_TOKENS = 100_000
-  const prepareAt = Math.max(Math.round(trigger / 2), trigger - PREPARE_HEADROOM_TOKENS)
-  let live: Message[] = []
-  let compactions = 0
-  let preparedThisCycle = false
-  for (const m of raw) {
-    live.push(m)
-    const size = tokens(live)
-    if (values.background && size >= prepareAt && size < trigger && !preparedThisCycle) {
-      preparedThisCycle = true
-      const prepared = await prepare(
-        { sessionKey: key, messages: live, api: apiForm(live, blocks), showCommand: SHOW_COMMAND(key) },
-        config,
-        ledgerFn
-      )
-      process.stdout.write(`   prepare at ${Math.round(size / 1000)}k: ${JSON.stringify(prepared)}\n`)
+    process.stdout.write(`${raw.length} messages, ${tokens(raw).toLocaleString('en-US')} est. tokens raw; budget ${config.budgetTokens}, trigger ${trigger}\n`)
+    const ledgerFn = values['no-llm'] ? noLedger : undefined
+    const PREPARE_HEADROOM_TOKENS = 100_000
+    const prepareAt = Math.max(Math.round(trigger / 2), trigger - PREPARE_HEADROOM_TOKENS)
+    let live: Message[] = []
+    let compactions = 0
+    let preparedThisCycle = false
+    for (const m of raw) {
+      live.push(m)
+      const size = tokens(live)
+      if (values.background && size >= prepareAt && size < trigger && !preparedThisCycle) {
+        preparedThisCycle = true
+        try {
+          const prepared = await prepare(
+            { sessionKey: key, messages: live, api: apiForm(live, blocks), showCommand: SHOW_COMMAND(key) },
+            config,
+            ledgerFn
+          )
+          process.stdout.write(`   prepare at ${Math.round(size / 1000)}k: ${JSON.stringify(prepared)}\n`)
+        } catch (error) {
+          if (!(error instanceof DeclineError)) throw error
+          process.stdout.write(`   prepare declined at ${Math.round(size / 1000)}k: ${error.message}\n`)
+        }
+      }
+      if (size < trigger) continue
+      preparedThisCycle = false
+      let result
+      try {
+        result = await compact(
+          { sessionKey: key, messages: live, api: apiForm(live, blocks), showCommand: SHOW_COMMAND(key), ...(values.background ? { ledgerMode: 'ready' as const } : {}) },
+          config,
+          ledgerFn
+        )
+      } catch (error) {
+        if (!(error instanceof DeclineError)) throw error
+        // Live, the plugin falls back to the built-in compactor here; replay can only stop.
+        process.stdout.write(`#${compactions + 1} declined, stopping: ${error.message}\n`)
+        break
+      }
+      live = result.entries.map(e => ('keep' in e ? live[e.keep] : e.built))
+      compactions++
+      process.stdout.write(`#${compactions} ${summarize(result.stats)}\n`)
+      // As the plugin does: a ready compaction that left the ledger behind catches it up through the committed cut.
+      if (values.background && result.stats.ledgerThrough < result.stats.cut) {
+        const caught = await prepare({ sessionKey: key, through: result.stats.cut }, config, ledgerFn)
+        process.stdout.write(`   catch-up: ${JSON.stringify(caught)}\n`)
+      }
     }
-    if (size < trigger) continue
-    preparedThisCycle = false
-    let result
-    try {
-      result = await compact(
-        { sessionKey: key, messages: live, api: apiForm(live, blocks), showCommand: SHOW_COMMAND(key), ...(values.background ? { ledgerMode: 'ready' as const } : {}) },
-        config,
-        ledgerFn
-      )
-    } catch (error) {
-      if (!(error instanceof DeclineError)) throw error
-      // Live, the plugin falls back to the built-in compactor here; replay can only stop.
-      process.stdout.write(`#${compactions + 1} declined, stopping: ${error.message}\n`)
-      break
-    }
-    live = result.entries.map(e => ('keep' in e ? live[e.keep] : e.built))
-    compactions++
-    process.stdout.write(`#${compactions} ${summarize(result.stats)}\n`)
-    // As the plugin does: a ready compaction that left the ledger behind catches it up through the committed cut.
-    if (values.background && result.stats.ledgerThrough < result.stats.cut) {
-      const caught = await prepare({ sessionKey: key, through: result.stats.cut }, config, ledgerFn)
-      process.stdout.write(`   catch-up: ${JSON.stringify(caught)}\n`)
-    }
+    process.stdout.write(`end: live ${tokens(live).toLocaleString('en-US')} est. tokens after ${compactions} compactions\n`)
+  } finally {
+    if (values.keep) process.stdout.write(`data kept in ${dataDir}\n`)
+    else rmSync(dataDir, { recursive: true, force: true })
   }
-  process.stdout.write(`end: live ${tokens(live).toLocaleString('en-US')} est. tokens after ${compactions} compactions\n`)
-  if (values.keep) process.stdout.write(`data kept in ${dataDir}\n`)
-  else rmSync(dataDir, { recursive: true, force: true })
 }
 
 const [command, ...rest] = process.argv.slice(2)

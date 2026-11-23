@@ -99,6 +99,7 @@ type CliSessionStatus = {
     age: number
     preparedAt: string
     compatible: boolean
+    status?: 'compatible' | 'pending' | 'stale'
   }
 }
 
@@ -137,6 +138,38 @@ function cli($: EngineInterface): string[] {
   return ['node', `${$.plugin.root}/bin/strata.mjs`]
 }
 
+/** Compact section-aware trim for intermediate multi-chunk ledger outputs, preserving Current state and Open items. */
+function trimIntermediateLedger(ledger: string, maxChars: number): string {
+  if (ledger.length <= maxChars) return ledger
+  const priorityOf = (h: string) => {
+    const l = h.toLowerCase()
+    if (l.includes('current state')) return 6
+    if (l.includes('open item')) return 5
+    if (l.includes('goal')) return 4
+    if (l.includes('constraint') || l.includes('preference')) return 3
+    if (l.includes('decision')) return 2
+    if (l.includes('dead end')) return 1
+    return 0
+  }
+  const sections: Array<{ heading: string; priority: number; lines: string[] }> = []
+  for (const line of ledger.split('\n')) {
+    if (line.startsWith('## ')) sections.push({ heading: line, priority: priorityOf(line), lines: [] })
+    else if (sections.length > 0 && line.trim()) sections[sections.length - 1]!.lines.push(line)
+  }
+  if (!sections.length) return ledger.slice(0, maxChars)
+  const render = () => sections.map(s => (s.lines.length ? `${s.heading}\n${s.lines.join('\n')}` : s.heading)).join('\n\n')
+  let out = render()
+  while (out.length > maxChars && sections.length > 0) {
+    const ordered = [...sections].sort((a, b) => a.priority - b.priority)
+    const target = ordered.find(s => s.lines.length > 0)
+    if (target && target.lines.length > 1) target.lines.shift()
+    else if (sections.length > 1) sections.splice(sections.indexOf(ordered[0]!), 1)
+    else break
+    out = render()
+  }
+  return out.length <= maxChars ? out : out.slice(0, maxChars)
+}
+
 /** Run every chunk of a ledger plan through Claude Code's `$.model.complete`. */
 async function executeLedgerPlan($: EngineInterface, plan: LedgerPlanNeeded): Promise<PreparedLedger> {
   let ledger = plan.previous
@@ -151,9 +184,8 @@ async function executeLedgerPlan($: EngineInterface, plan: LedgerPlanNeeded): Pr
     if (!reply.isAnswered) throw new Error(`ledger model failed: ${describeModelFailure(reply)}`)
     const text = reply.text.trim()
     if (!text) throw new Error('ledger model returned empty text')
-    // Bound intermediate chunk outputs if a multi-chunk run ignores the prompt cap;
-    // final section-aware trimming is enforced by the CLI on save/compact.
-    ledger = plan.chunks.length > 1 && text.length > plan.maxChars * 2 ? text.slice(0, plan.maxChars * 2) : text
+    // Bound intermediate chunk outputs section-aware so Current state / Open items survive multi-chunk runs.
+    ledger = plan.chunks.length > 1 ? trimIntermediateLedger(text, plan.maxChars * 2) : text
   }
   return {
     ledger,
@@ -222,10 +254,16 @@ export async function prepareLedger($: EngineInterface, session: string, target?
   $.ui.log(`ledger prep ${saveRun.exitCode === 0 ? saveRun.stdout.trim() : `save failed (exit ${saveRun.exitCode}): ${saveRun.stderr.slice(-300)}`}`, { to: 'debug' })
 }
 
-// One background ledger job in flight per session; reset cleanly on session.start.
+// One background ledger job in flight per session; reset cleanly on session.start and session.end (/clear, /resume).
 let preparing = false
 let sessionGen = 0
 let pendingCatchUp: { session: string; through: number } | undefined
+
+function resetBackgroundState(): void {
+  sessionGen++
+  preparing = false
+  pendingCatchUp = undefined
+}
 
 function prepareInBackground($: EngineInterface, session: string, target?: PrepareTarget): void {
   if (preparing) {
@@ -236,6 +274,7 @@ function prepareInBackground($: EngineInterface, session: string, target?: Prepa
   preparing = true
   const gen = sessionGen
   $.clock.after(0, () => {
+    if (gen !== sessionGen) return
     prepareLedger($, session, target)
       .catch(error => $.ui.log(`ledger prep failed: ${describe(error)}`, { to: 'debug' }))
       .finally(() => {
@@ -261,12 +300,12 @@ export async function strataCompact(
   let ledgerError: string | undefined
 
   // strata-trigger compacts with the ready ledger so the user never waits.
-  // /compact (and auto) bring the ledger up to date via $.model.complete first.
-  if (e.trigger !== 'plugin') {
+  // /compact (and auto, or any compaction with explicit instructions) brings the ledger up to date via $.model.complete first.
+  if (e.trigger !== 'plugin' || e.instructions) {
     const planArgv = [...cli($), 'ledger-plan', '--session', session, '--in', '-', '--sync']
-    if (e.instructions) planArgv.push('--instructions', e.instructions)
+    if (e.instructions) planArgv.push(`--instructions=${e.instructions}`)
     const planRun = await $.process.run(planArgv, {
-      stdin: JSON.stringify({ messages: snapshot, ...hidden }),
+      stdin: JSON.stringify({ messages: snapshot, ...hidden, ...(e.instructions ? { instructions: e.instructions } : {}) }),
       timeoutMs: CLI_TIMEOUT_MS
     })
     if (planRun.exitCode === EXIT_DECLINED) {
@@ -286,11 +325,12 @@ export async function strataCompact(
   }
 
   const argv = [...cli($), 'compact', '--session', session, '--in', '-', '--out', '-', '--ledger', 'ready', '--native-tools']
-  if (e.instructions) argv.push('--instructions', e.instructions)
+  if (e.instructions) argv.push(`--instructions=${e.instructions}`)
   const run = await $.process.run(argv, {
     stdin: JSON.stringify({
       messages: snapshot,
       ...hidden,
+      ...(e.instructions ? { instructions: e.instructions } : {}),
       ...(preparedLedger ? { preparedLedger } : {}),
       ...(ledgerError ? { ledgerError } : {})
     }),
@@ -345,9 +385,7 @@ export async function thresholds($: EngineInterface): Promise<Thresholds> {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    sessionGen++
-    preparing = false
-    pendingCatchUp = undefined
+    resetBackgroundState()
     await Promise.all([
       $.tool.register({
         name: 'show',
@@ -391,6 +429,12 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // /clear and /resume fire session.end (never session.start), so reset background prep state here too.
+  on('session.end', (_$, e, next) => {
+    resetBackgroundState()
+    return next(e)
+  })
+
   on('tool.check', { tool: SHOW_TOOL }, async (_$, e, next) => {
     const verdict = await next(e)
     return verdict.decision === 'deny' ? verdict : { decision: 'allow', reason: 'read-only strata archive lookup' }
@@ -403,21 +447,29 @@ export const register: Register = on => {
 
   on('tool.call', { tool: SHOW_TOOL }, async ($, e) => {
     const seq = typeof e.seq === 'number' && Number.isFinite(e.seq) ? Math.floor(e.seq) : -1
-    if (seq < 0) return { isError: true, result: 'seq must be a non-negative integer' }
+    if (seq < 0) return { isError: true, result: 'seq must be a non-negative integer', text: 'seq must be a non-negative integer' }
+    const lastSeq = typeof e.last_seq === 'number' && Number.isFinite(e.last_seq) ? Math.floor(e.last_seq) : undefined
+    if (lastSeq !== undefined && lastSeq < seq) {
+      const msg = `last_seq (${lastSeq}) must be >= seq (${seq})`
+      return { isError: true, result: msg, text: msg }
+    }
     const session = await $.session.id()
     const argv = [...cli($), 'show']
     const offset = typeof e.offset === 'number' && Number.isFinite(e.offset) && e.offset >= 0 ? Math.floor(e.offset) : 0
     const limit = typeof e.limit === 'number' && Number.isFinite(e.limit) && e.limit > 0 ? Math.min(100_000, Math.floor(e.limit)) : 20_000
     argv.push('--offset', String(offset), '--limit', String(limit), '--', session, String(seq))
-    if (typeof e.last_seq === 'number' && Number.isFinite(e.last_seq)) argv.push(String(Math.floor(e.last_seq)))
+    if (lastSeq !== undefined) argv.push(String(lastSeq))
     const run = await $.process.run(argv, { timeoutMs: TOOL_TIMEOUT_MS })
-    if (run.exitCode !== 0) return { isError: true, result: (run.stderr || run.stdout || `strata show failed (exit ${run.exitCode})`).trim() }
+    if (run.exitCode !== 0) {
+      const msg = (run.stderr || run.stdout || `strata show failed (exit ${run.exitCode})`).trim()
+      return { isError: true, result: msg, text: msg }
+    }
     return { result: run.stdout.trimEnd() }
-  }).catch(() => ({ isError: true, result: 'strata show failed' }))
+  }).catch(() => ({ isError: true, result: 'strata show failed', text: 'strata show failed' }))
 
   on('tool.call', { tool: SEARCH_TOOL }, async ($, e) => {
     const query = typeof e.query === 'string' ? e.query : ''
-    if (!query) return { isError: true, result: 'query must be a non-empty string' }
+    if (!query) return { isError: true, result: 'query must be a non-empty string', text: 'query must be a non-empty string' }
     const session = await $.session.id()
     const argv = [...cli($), 'search']
     if (e.all_branches === true) argv.push('--all-branches')
@@ -429,9 +481,12 @@ export const register: Register = on => {
     if (typeof e.max_matches === 'number' && Number.isFinite(e.max_matches) && e.max_matches > 0) argv.push('--max', String(Math.min(100, Math.floor(e.max_matches))))
     argv.push('--', session, query)
     const run = await $.process.run(argv, { timeoutMs: TOOL_TIMEOUT_MS })
-    if (run.exitCode !== 0) return { isError: true, result: (run.stderr || run.stdout || `strata search failed (exit ${run.exitCode})`).trim() }
+    if (run.exitCode !== 0) {
+      const msg = (run.stderr || run.stdout || `strata search failed (exit ${run.exitCode})`).trim()
+      return { isError: true, result: msg, text: msg }
+    }
     return { result: run.stdout.trimEnd() }
-  }).catch(() => ({ isError: true, result: 'strata search failed' }))
+  }).catch(() => ({ isError: true, result: 'strata search failed', text: 'strata search failed' }))
 
   on('command.run', { command: STATUS_COMMAND }, async $ => {
     const [session, limits, usage] = await Promise.all([$.session.id(), thresholds($), $.session.usage()])
@@ -446,8 +501,9 @@ export const register: Register = on => {
     const ledgerLine = s.ledgerChars > 0
       ? `ledger: ${s.ledgerChars.toLocaleString('en-US')} chars covering ${s.ledgerThrough} rows (age ${s.ledgerAge}${s.ledgerLag > 0 ? `, lags cut by ${s.ledgerLag} rows` : s.lastCut !== undefined ? ', up to date' : ''})`
       : `ledger: empty${s.ledgerLag > 0 ? ` (lags cut by ${s.ledgerLag} rows)` : ''}`
+    const readyStatus = s.readyLedger?.status ?? (s.readyLedger?.compatible ? 'compatible' : 'stale')
     const readyLine = s.readyLedger
-      ? `ready ledger: ${s.readyLedger.chars.toLocaleString('en-US')} chars covering ${s.readyLedger.through} rows (${s.readyLedger.compatible ? 'compatible' : 'stale'}, prepared ${s.readyLedger.preparedAt})`
+      ? `ready ledger: ${s.readyLedger.chars.toLocaleString('en-US')} chars covering ${s.readyLedger.through} rows (${readyStatus}, prepared ${s.readyLedger.preparedAt})`
       : 'ready ledger: none'
     return {
       text: [

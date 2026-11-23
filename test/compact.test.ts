@@ -469,13 +469,15 @@ describe('renderIndex', () => {
     const msgs: Message[] = [
       user('run the test suite'),
       { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'b1', tool: 'Bash', input: { command: 'pnpm test --filter auth\necho done' } }] },
-      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'b1', text: 'running tests...\nFAIL src/auth.test.ts\nTypeError: token is undefined', isError: true }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'b1', text: 'running tests...\nFAIL src/auth.test.ts\nTypeError: token is undefined\nExit code 1', isError: true }] },
       answer('investigating failure')
     ]
     const episodes = segmentEpisodes(msgs.map((m, seq) => ({ ...m, seq })))
     const rendered = renderEpisode(episodes[0])
     expect(rendered).toContain('cmds: `pnpm test --filter auth`')
+    // Must prefer the real error line over a trailing generic "Exit code 1".
     expect(rendered).toContain('errors: 1 (TypeError: token is undefined)')
+    expect(renderIndex(episodes, 0)).toBe('')
   })
 })
 
@@ -662,5 +664,85 @@ describe('v0.3 improvements and edge cases', () => {
     expect(mediaExtension('image/svg+xml')).toBe('svgxml')
     expect(mediaExtension('image/../../etc/passwd')).toBe('png')
     expect(mediaExtension('')).toBe('png')
+  })
+
+  it('throws OversizeError (never TypeError) when a single unit exceeds the budget', async () => {
+    const singleOversize = [user('x'.repeat(BUDGET_CHARS + 5_000))]
+    await expect(run(singleOversize)).rejects.toBeInstanceOf(OversizeError)
+  })
+
+  it('reclaims unused middle slack into verbatim tail when cut === 0 and sizes preparedLedger without wasting the 6% cap', async () => {
+    const cfg200k = loadConfig({ dataDir: dir, budgetTokens: 200_000, ledgerRebuildEvery: 0 })
+    const budget = 200_000 * 3.5
+    const turns120 = Array.from({ length: 120 }, (_, n) => turn(n)).flat()
+    const noEvict = await compact({ sessionKey: 'slack-cut0', messages: turns120, showCommand: 'strata show slack-cut0', ledgerMode: 'ready' }, cfg200k)
+    expect(noEvict.stats.cut).toBe(0)
+    expect(noEvict.stats.outputChars).toBeLessThanOrEqual(budget)
+    expect(noEvict.stats.outputChars).toBeGreaterThan(budget * 0.9)
+
+    // With 400 turns and a short preparedLedger, layout uses its actual length instead of wasting 42k chars.
+    const turns400 = Array.from({ length: 400 }, (_, n) => turn(n)).flat()
+    const plan = planLedger({ sessionKey: 'slack-prep', messages: turns400, showCommand: 'strata show slack-prep' }, cfg200k, { enforceMinChars: false })
+    expect(plan.needed).toBe(true)
+    if (!plan.needed) return
+    const withPrepared = await compact(
+      {
+        sessionKey: 'slack-prep',
+        messages: turns400,
+        showCommand: 'strata show slack-prep',
+        ledgerMode: 'ready',
+        preparedLedger: { ledger: '## Current state\n- compact (#0)', through: plan.through, prefixHash: plan.prefixHash, age: plan.age, requests: 1 }
+      },
+      cfg200k
+    )
+    expect(withPrepared.stats.outputChars).toBeLessThanOrEqual(budget)
+    expect(withPrepared.stats.outputChars).toBeGreaterThan(budget * 0.98)
+  })
+
+  it('rejects a foreign wrong-role or non-strata-header prefix even when a generic tail matches', async () => {
+    const live = Array.from({ length: 12 }, (_, n) => turn(n)).flat()
+    const first = await run(live)
+    const out = materialize(live, first.entries)
+    const firstKeep = first.entries.findIndex(e => 'keep' in e)
+    expect(firstKeep).toBeGreaterThan(0)
+    // Replace all built messages before the kept tail with wrong-role foreign messages.
+    const forged = out.map((m, i) => (i < firstKeep ? { role: m.role === 'user' ? ('assistant' as const) : ('user' as const), text: `foreign ${i}`, toolUses: [] } : m))
+    const second = await run(forged)
+    expect(second.stats.matched).toBe(0)
+    expect(second.stats.matchedPrevious).toBe(false)
+  })
+
+  it('self-heals multiple corrupt trailing lines in archive.jsonl and avoids splitting emoji surrogates in maskMessage', async () => {
+    const live = Array.from({ length: 12 }, (_, n) => turn(n)).flat()
+    const first = await run(live)
+    const sdir = join(dir, 'sessions', SESSION)
+    appendFileSync(join(sdir, 'archive.jsonl'), '{"seq":998,"broken\n{"seq":999,"also-broken')
+    const second = await run([...materialize(live, first.entries), ...turn(80)])
+    expect(second.stats.archived).toBe(live.length + 4)
+    expect(readArchive(sdir)).toHaveLength(live.length + 4)
+
+    const emojiResult: Message = {
+      role: 'user',
+      text: '🔥'.repeat(3_000),
+      toolUses: [],
+      toolResults: [{ tool_use_id: 'e1', text: '🚀'.repeat(1_000), isError: false }]
+    }
+    const masked = maskMessage(emojiResult, 5, config)
+    const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
+    expect(masked.text).not.toMatch(loneSurrogate)
+    expect(masked.toolResults?.[0].text).not.toMatch(loneSurrogate)
+  })
+
+  it('scales masked middle consistently with calibrated text density on dense non-thinking sessions', async () => {
+    const denseTurns = Array.from({ length: 16 }, (_, n) => turn(n)).flat()
+    // 2.0 chars/token (1.75x denser than 3.5) -> real budget in raw chars must shrink accordingly.
+    const denseUsage = { tokens: Math.round(chars(denseTurns.slice(0, -1)) / 2.0) + 1_000, overhead: 1_000 }
+    const defaultRun = await run(denseTurns)
+    rmSync(dir, { recursive: true, force: true })
+    const denseRun = await compact({ sessionKey: SESSION, messages: denseTurns, showCommand: SHOW, usage: denseUsage }, config, fakeLedger)
+    expect(denseRun.stats.charsPerToken).toBeLessThan(2.5)
+    expect(denseRun.stats.outputChars).toBeLessThanOrEqual(BUDGET_CHARS)
+    const rawOutChars = chars(materialize(denseTurns, denseRun.entries))
+    expect(rawOutChars).toBeLessThan(chars(materialize(denseTurns, defaultRun.entries)))
   })
 })

@@ -35,6 +35,8 @@ export type ArchivedMessage = Message & { seq: number; media?: MediaRef[] }
  */
 export type OutputEntry = { keep: number } | { built: Message }
 
+export const HEADER_MARK = '[strata: compacted conversation]'
+
 /** One message of the last compaction's output, as the next input should repeat it. */
 export type OutputRecord = {
   fp: string
@@ -42,6 +44,10 @@ export type OutputRecord = {
   upto: number
   /** Archive seq when it was a raw message passed through by handle; -1 when strata built it. */
   seq: number
+  /** Message role, used to reject wrong-role false matches on normalized built messages. */
+  role?: 'user' | 'assistant'
+  /** True when this built message is strata's compaction header. */
+  isHeader?: true
 }
 
 export type SessionState = {

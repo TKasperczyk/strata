@@ -32,7 +32,8 @@ function createOAuthFetch(): typeof fetch {
     const raw = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
     const url = new URL(raw)
     if (url.pathname === '/v1/messages' && !url.searchParams.has('beta')) url.searchParams.set('beta', 'true')
-    return globalThis.fetch(url.toString(), init)
+    const target = typeof input === 'string' || input instanceof URL ? url.toString() : new Request(url.toString(), input)
+    return globalThis.fetch(target, init)
   }
 }
 

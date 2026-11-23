@@ -11,6 +11,11 @@ import { parseArgs } from "util";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, truncateSync, writeFileSync } from "fs";
 import { createHash } from "crypto";
 import { join } from "path";
+
+// src/types.ts
+var HEADER_MARK = "[strata: compacted conversation]";
+
+// src/archive.ts
 var INITIAL_STATE = {
   branch: [],
   lastOutput: [],
@@ -53,17 +58,34 @@ function repairTrailingLine(path2) {
   const raw = readFileSync(path2);
   if (raw.length === 0) return;
   let end = raw.length;
-  while (end > 0 && (raw[end - 1] === 10 || raw[end - 1] === 13)) end--;
-  const lastNl = raw.lastIndexOf(10, Math.max(0, end - 1));
-  const lastLine = raw.subarray(lastNl + 1, end).toString("utf-8").trim();
-  if (!lastLine) return;
-  try {
-    const parsed = JSON.parse(lastLine);
-    if (!isArchivedMessage(parsed)) throw new Error("invalid archive row");
-    if (raw[raw.length - 1] !== 10) appendFileSync(path2, "\n");
-  } catch {
-    truncateSync(path2, lastNl >= 0 ? lastNl + 1 : 0);
+  let truncated = false;
+  while (end > 0) {
+    let lineEnd = end;
+    while (lineEnd > 0 && (raw[lineEnd - 1] === 10 || raw[lineEnd - 1] === 13)) lineEnd--;
+    if (lineEnd === 0) {
+      end = 0;
+      truncated = true;
+      break;
+    }
+    const lastNl = raw.lastIndexOf(10, lineEnd - 1);
+    const lineStart = lastNl >= 0 ? lastNl + 1 : 0;
+    const text = raw.subarray(lineStart, lineEnd).toString("utf-8").trim();
+    if (!text) {
+      end = lineStart;
+      truncated = true;
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(text);
+      if (!isArchivedMessage(parsed)) throw new Error("invalid archive row");
+      break;
+    } catch {
+      end = lineStart;
+      truncated = true;
+    }
   }
+  if (truncated) truncateSync(path2, end);
+  if (end > 0 && raw[end - 1] !== 10) appendFileSync(path2, "\n");
 }
 function appendArchive(dir, archived) {
   if (!archived.length) return;
@@ -75,7 +97,7 @@ function appendArchive(dir, archived) {
 function isOutputRecord(v) {
   if (!v || typeof v !== "object" || Array.isArray(v)) return false;
   const r = v;
-  return typeof r.fp === "string" && typeof r.upto === "number" && typeof r.seq === "number";
+  return typeof r.fp === "string" && typeof r.upto === "number" && typeof r.seq === "number" && (r.role === void 0 || r.role === "user" || r.role === "assistant") && (r.isHeader === void 0 || r.isHeader === true);
 }
 function readState(dir) {
   const path2 = join(dir, "state.json");
@@ -141,9 +163,12 @@ function matchedPrefix(input, state) {
       p++;
       continue;
     }
+    const rec = out[p];
+    const roleMatches = rec.role === void 0 || input[p].role === rec.role;
+    const headerMatches = !rec.isHeader || input[p].text.includes(HEADER_MARK);
     const tailIntact = hasKeptFrom[p + 1] && keptMatchFrom[p + 1];
     const fallbackIntact = !hasKeptFrom[0] && p + 1 < out.length && restSame[p + 1];
-    if (out[p].seq === -1 && (tailIntact || fallbackIntact)) {
+    if (rec.seq === -1 && roleMatches && headerMatches && (tailIntact || fallbackIntact)) {
       p++;
       continue;
     }
@@ -196,6 +221,105 @@ function shareChars(config, share) {
   return Math.floor(budgetChars(config) * config.shares[share]);
 }
 
+// src/mask.ts
+var STUB_PREFIX = "[strata elided";
+function messageChars(m) {
+  let n = m.text.length;
+  for (const u of m.toolUses) n += u.tool.length + JSON.stringify(u.input).length;
+  for (const r of m.toolResults ?? []) n += r.text.length;
+  return n;
+}
+function safeSlicePrefix(text, max) {
+  if (max <= 0) return "";
+  if (text.length <= max) return text;
+  const code = text.charCodeAt(max - 1);
+  return code >= 55296 && code <= 56319 ? text.slice(0, max - 1) : text.slice(0, max);
+}
+function safeSliceSuffix(text, max) {
+  if (max <= 0) return "";
+  if (text.length <= max) return text;
+  const start = text.length - max;
+  const code = text.charCodeAt(start);
+  return code >= 56320 && code <= 57343 ? text.slice(start + 1) : text.slice(start);
+}
+function cut(text, max) {
+  if (text.length <= max) return text;
+  const prefix = safeSlicePrefix(text, max);
+  return `${prefix}\u2026[+${text.length - prefix.length} chars]`;
+}
+function cutWithSeq(text, max, seq) {
+  if (text.length <= max) return text;
+  if (max < 80) return cut(text, max);
+  const head = Math.floor(max * 0.65);
+  const tail = max - head;
+  const prefix = safeSlicePrefix(text, head);
+  const suffix = tail > 0 ? safeSliceSuffix(text, tail) : "";
+  const omitted = text.length - prefix.length - suffix.length;
+  if (omitted <= 0) return text;
+  const note = `
+\u2026[strata omitted ${omitted.toLocaleString("en-US")} chars; full text is archive seq ${seq}]\u2026
+`;
+  const shortened = `${prefix}${note}${suffix}`;
+  return shortened.length < text.length ? shortened : text;
+}
+function capInput(value, max) {
+  if (typeof value === "string") return cut(value, max);
+  if (Array.isArray(value)) return value.map((v) => capInput(v, max));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, capInput(v, max)]));
+  }
+  return value;
+}
+function stub(chars, seq) {
+  return `${STUB_PREFIX} a ${chars.toLocaleString("en-US")}-char tool result; full text is archive seq ${seq}]`;
+}
+function maskResultText(text, isError, seq, config) {
+  const keep = isError ? config.errorResultChars : config.smallResultChars;
+  if (text.length <= keep) return text;
+  const header = stub(text.length, seq);
+  if (keep <= 0) return header;
+  const head = isError ? Math.floor(keep * 0.5) : Math.floor(keep * 0.6);
+  const tail = keep - head;
+  const prefix = safeSlicePrefix(text, head);
+  const suffix = tail > 0 ? safeSliceSuffix(text, tail) : "";
+  const excerpt = `${header}
+${prefix}
+\u2026
+${suffix}`;
+  return excerpt.length < text.length ? excerpt : text;
+}
+function maskMessage(m, seq, config) {
+  if (m.role === "user") {
+    return {
+      role: "user",
+      text: cutWithSeq(m.text, config.userTextCapChars, seq),
+      toolUses: [],
+      ...m.toolResults ? {
+        toolResults: m.toolResults.map((r) => ({
+          ...r,
+          text: maskResultText(r.text, r.isError, seq, config)
+        }))
+      } : {}
+    };
+  }
+  return {
+    role: "assistant",
+    text: cutWithSeq(m.text, config.assistantTextCapChars, seq),
+    toolUses: m.toolUses.map((u) => ({
+      tool_use_id: u.tool_use_id,
+      tool: u.tool,
+      input: capInput(u.input, config.inputCapChars)
+    }))
+  };
+}
+function renderMessage(m, seq) {
+  const lines = [];
+  if (m.text) lines.push(`#${seq} ${m.role}: ${m.text}`);
+  for (const u of m.toolUses) lines.push(`#${seq} call ${u.tool} ${JSON.stringify(u.input)}`);
+  for (const r of m.toolResults ?? []) lines.push(`#${seq} result${r.isError ? " (error)" : ""}: ${r.text}`);
+  return lines.join("\n");
+}
+
 // src/episodes.ts
 var FILE_KEYS = ["file_path", "path", "notebook_path"];
 var MAX_FILES = 6;
@@ -208,13 +332,15 @@ var LINE_CHARS = 600;
 var PROMPT_CHARS = 140;
 var OUTCOME_CHARS = 160;
 var DEFAULT_PROTECT_RECENT = 4;
-var ERROR_LINE_RE = /\b(error|failed|fail|exception|panic|fatal|denied|not found|exit code|enoent|eexist|eacces|typeerror|syntaxerror|referenceerror)\b/i;
+var SPECIFIC_ERROR_RE = /\b(error|failed|fail|exception|panic|fatal|denied|not found|enoent|eexist|eacces|econnrefused|typeerror|syntaxerror|referenceerror|assertionerror)\b/i;
+var GENERIC_EXIT_RE = /^(command\s+(failed|exited)\b.*|exit\s+code\s+\d+\b.*|exited\s+with\s+(code|status)\s+\d+\b.*)$/i;
+var FALLBACK_ERROR_RE = /\b(exit code|exited with)\b/i;
 function oneLine(text, max) {
   const flat = text.replace(/\s+/g, " ").trim();
-  return flat.length <= max ? flat : `${flat.slice(0, max)}\u2026`;
+  return flat.length <= max ? flat : `${safeSlicePrefix(flat, max)}\u2026`;
 }
 function shortPath(path2) {
-  return path2.length <= PATH_CHARS ? path2 : `\u2026${path2.slice(-(PATH_CHARS - 1))}`;
+  return path2.length <= PATH_CHARS ? path2 : `\u2026${safeSliceSuffix(path2, PATH_CHARS - 1)}`;
 }
 function compactCommand(raw) {
   const lines = raw.split("\n").map((l) => l.trim()).filter(Boolean);
@@ -226,9 +352,17 @@ function compactErrorHint(raw) {
   if (!lines.length) return "";
   let picked;
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (ERROR_LINE_RE.test(lines[i])) {
+    if (SPECIFIC_ERROR_RE.test(lines[i]) && !GENERIC_EXIT_RE.test(lines[i])) {
       picked = lines[i];
       break;
+    }
+  }
+  if (!picked) {
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (FALLBACK_ERROR_RE.test(lines[i])) {
+        picked = lines[i];
+        break;
+      }
     }
   }
   return oneLine(picked ?? lines[0], ERROR_HINT_CHARS);
@@ -310,6 +444,7 @@ function renderEpisode(e) {
   return oneLine(`- ${parts.join(" \xB7 ")}`, LINE_CHARS);
 }
 function renderIndex(episodes, maxChars, options = {}) {
+  if (maxChars <= 0 || episodes.length === 0) return "";
   const list = [...episodes];
   const protectRecent = options.protectRecent ?? DEFAULT_PROTECT_RECENT;
   const recentSeq = protectRecent > 0 && episodes.length > protectRecent ? episodes[episodes.length - protectRecent].first : void 0;
@@ -318,8 +453,8 @@ function renderIndex(episodes, maxChars, options = {}) {
     if (recentSeq !== void 0 && e.last >= recentSeq) return 1;
     return 0;
   };
-  const lengths = list.map((e) => renderEpisode(e).length + 1);
-  let total = lengths.reduce((a, b) => a + b, 0);
+  const lengths = list.map((e) => renderEpisode(e).length);
+  let total = lengths.reduce((a, b) => a + b, 0) + Math.max(0, list.length - 1);
   while (list.length > 1 && total > maxChars) {
     let best = 0;
     let bestTier = Math.max(tier(list[0]), tier(list[1]));
@@ -334,13 +469,14 @@ function renderIndex(episodes, maxChars, options = {}) {
       }
     }
     const merged = merge(list[best], list[best + 1]);
-    const length = renderEpisode(merged).length + 1;
-    total += length - lengths[best] - lengths[best + 1];
+    const length = renderEpisode(merged).length;
+    total += length - lengths[best] - lengths[best + 1] - 1;
     list.splice(best, 2, merged);
     lengths.splice(best, 2, length);
   }
   const index = list.map(renderEpisode).join("\n");
-  return index.length <= maxChars ? index : `${index.slice(0, Math.max(0, maxChars - 1))}\u2026`;
+  if (index.length <= maxChars) return index;
+  return maxChars === 1 ? "\u2026" : `${safeSlicePrefix(index, maxChars - 1)}\u2026`;
 }
 
 // node_modules/.pnpm/@anthropic-ai+sdk@0.90.0/node_modules/@anthropic-ai/sdk/internal/tslib.mjs
@@ -6265,7 +6401,8 @@ function createOAuthFetch() {
     const raw = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     const url = new URL(raw);
     if (url.pathname === "/v1/messages" && !url.searchParams.has("beta")) url.searchParams.set("beta", "true");
-    return globalThis.fetch(url.toString(), init);
+    const target = typeof input === "string" || input instanceof URL ? url.toString() : new Request(url.toString(), input);
+    return globalThis.fetch(target, init);
   };
 }
 function loadKeychainCredentials() {
@@ -6333,85 +6470,6 @@ async function createAnthropicClient() {
   });
 }
 
-// src/mask.ts
-var STUB_PREFIX = "[strata elided";
-function messageChars(m) {
-  let n = m.text.length;
-  for (const u of m.toolUses) n += u.tool.length + JSON.stringify(u.input).length;
-  for (const r of m.toolResults ?? []) n += r.text.length;
-  return n;
-}
-function cut(text, max) {
-  return text.length <= max ? text : `${text.slice(0, max)}\u2026[+${text.length - max} chars]`;
-}
-function cutWithSeq(text, max, seq) {
-  if (text.length <= max) return text;
-  if (max < 80) return cut(text, max);
-  const head = Math.floor(max * 0.65);
-  const tail = max - head;
-  const omitted = text.length - head - tail;
-  const note = `
-\u2026[strata omitted ${omitted.toLocaleString("en-US")} chars; full text is archive seq ${seq}]\u2026
-`;
-  const shortened = `${text.slice(0, head)}${note}${tail > 0 ? text.slice(-tail) : ""}`;
-  return shortened.length < text.length ? shortened : text;
-}
-function capInput(value, max) {
-  if (typeof value === "string") return cut(value, max);
-  if (Array.isArray(value)) return value.map((v) => capInput(v, max));
-  if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, capInput(v, max)]));
-  }
-  return value;
-}
-function stub(chars, seq) {
-  return `${STUB_PREFIX} a ${chars.toLocaleString("en-US")}-char tool result; full text is archive seq ${seq}]`;
-}
-function maskResultText(text, isError, seq, config) {
-  const keep = isError ? config.errorResultChars : config.smallResultChars;
-  if (text.length <= keep) return text;
-  const header = stub(text.length, seq);
-  if (keep <= 0) return header;
-  const head = isError ? Math.floor(keep * 0.5) : Math.floor(keep * 0.6);
-  const tail = keep - head;
-  const excerpt = `${header}
-${text.slice(0, head)}
-\u2026
-${tail > 0 ? text.slice(-tail) : ""}`;
-  return excerpt.length < text.length ? excerpt : text;
-}
-function maskMessage(m, seq, config) {
-  if (m.role === "user") {
-    return {
-      role: "user",
-      text: cutWithSeq(m.text, config.userTextCapChars, seq),
-      toolUses: [],
-      ...m.toolResults ? {
-        toolResults: m.toolResults.map((r) => ({
-          ...r,
-          text: maskResultText(r.text, r.isError, seq, config)
-        }))
-      } : {}
-    };
-  }
-  return {
-    role: "assistant",
-    text: cutWithSeq(m.text, config.assistantTextCapChars, seq),
-    toolUses: m.toolUses.map((u) => ({
-      tool_use_id: u.tool_use_id,
-      tool: u.tool,
-      input: capInput(u.input, config.inputCapChars)
-    }))
-  };
-}
-function renderMessage(m, seq) {
-  const lines = [];
-  if (m.text) lines.push(`#${seq} ${m.role}: ${m.text}`);
-  for (const u of m.toolUses) lines.push(`#${seq} call ${u.tool} ${JSON.stringify(u.input)}`);
-  for (const r of m.toolResults ?? []) lines.push(`#${seq} result${r.isError ? " (error)" : ""}: ${r.text}`);
-  return lines.join("\n");
-}
-
 // src/ledger.ts
 var LEDGER_SYSTEM_PROMPT = `You maintain the state ledger of a long Claude Code session whose older turns are being moved out of the live context into an archive.
 
@@ -6450,17 +6508,27 @@ function ledgerMaskConfig(config) {
 }
 function renderSpan(messages, config) {
   const maskCfg = ledgerMaskConfig(config);
+  const maxChunk = Math.max(1, config.ledgerChunkChars);
   const chunks = [];
   let current = "";
-  for (const m of messages) {
-    const line = renderMessage(maskMessage(m, m.seq, maskCfg), m.seq);
-    if (!line) continue;
-    if (current && current.length + line.length > config.ledgerChunkChars) {
+  const pushPiece = (piece) => {
+    if (!piece) return;
+    const bounded = piece.length + 1 <= maxChunk ? piece : maxChunk > 18 ? `${safeSlicePrefix(piece, maxChunk - 17)}\u2026[chunk capped]` : safeSlicePrefix(piece, Math.max(1, maxChunk - 1));
+    if (current && current.length + bounded.length + 1 > maxChunk) {
       chunks.push(current);
       current = "";
     }
-    current += `${line}
+    current += `${bounded}
 `;
+  };
+  for (const m of messages) {
+    const rendered = renderMessage(maskMessage(m, m.seq, maskCfg), m.seq);
+    if (!rendered) continue;
+    if (rendered.length + 1 <= maxChunk) {
+      pushPiece(rendered);
+    } else {
+      for (const line of rendered.split("\n")) pushPiece(line);
+    }
   }
   if (current) chunks.push(current);
   return chunks;
@@ -6513,17 +6581,13 @@ function trimLedger(ledger, maxChars, note = "\n\u2026[ledger cut to its budget]
       sections.push({ heading: line, ...meta, lines: [], trimmed: false });
     } else if (sections.length === 0) {
       preambleLines.push(line);
-    } else {
+    } else if (line.trim()) {
       sections[sections.length - 1].lines.push(line);
     }
   }
-  for (const s of sections) {
-    while (s.lines.length && !s.lines[0].trim()) s.lines.shift();
-    while (s.lines.length && !s.lines[s.lines.length - 1].trim()) s.lines.pop();
-  }
   if (sections.length === 0) {
-    if (maxChars <= note.length) return ledger.slice(0, maxChars);
-    return `${ledger.slice(0, maxChars - note.length).trimEnd()}${note}`;
+    if (maxChars <= note.length) return safeSlicePrefix(ledger, maxChars);
+    return `${safeSlicePrefix(ledger, maxChars - note.length).trimEnd()}${note}`;
   }
   let preamble = preambleLines.join("\n").trim();
   let current = renderSections(preamble, sections);
@@ -6532,42 +6596,43 @@ function trimLedger(ledger, maxChars, note = "\n\u2026[ledger cut to its budget]
     current = renderSections(preamble, sections);
   }
   while (current.length > maxChars && sections.length > 0) {
-    const prevLen = current.length;
     const ordered = [...sections].sort((a, b) => a.priority - b.priority);
-    const withLines = ordered.find((s) => s.lines.length > 0);
-    if (withLines) {
-      if (withLines.lines.length > 1) {
-        if (withLines.keepNewest) withLines.lines.shift();
-        else withLines.lines.pop();
-        withLines.trimmed = true;
+    const empty = ordered.find((s2) => s2.lines.length === 0);
+    if (empty) {
+      sections.splice(sections.indexOf(empty), 1);
+      current = renderSections(preamble, sections);
+      continue;
+    }
+    const s = ordered[0];
+    if (s.lines.length > 1) {
+      if (s.keepNewest) s.lines.shift();
+      else s.lines.pop();
+      s.trimmed = true;
+    } else {
+      const overflow = current.length - maxChars;
+      const markerDelta = s.trimmed ? 0 : s.keepNewest ? "\u2026[older items trimmed]\n".length : "\n\u2026[trimmed]".length;
+      const target = s.lines[0].length - overflow - markerDelta - 1;
+      if (target >= 24 && target < s.lines[0].length) {
+        s.lines[0] = `${safeSlicePrefix(s.lines[0], target).trimEnd()}\u2026`;
+        s.trimmed = true;
+      } else if (sections.length > 1) {
+        sections.splice(sections.indexOf(s), 1);
+      } else if (s.trimmed) {
+        s.trimmed = false;
       } else {
-        const overflow = current.length - maxChars;
-        const line = withLines.lines[0];
-        const target = line.length - overflow - 16;
-        if (target >= 40) {
-          withLines.lines[0] = `${line.slice(0, target)}\u2026`;
-          withLines.trimmed = true;
+        const room = maxChars - s.heading.length - 2;
+        if (room >= 1 && room < s.lines[0].length) {
+          s.lines[0] = `${safeSlicePrefix(s.lines[0], room).trimEnd()}\u2026`;
         } else {
-          withLines.lines.length = 0;
-          withLines.trimmed = true;
+          break;
         }
       }
-    } else {
-      const victim = ordered[0];
-      const idx = sections.indexOf(victim);
-      if (idx >= 0) sections.splice(idx, 1);
     }
     current = renderSections(preamble, sections);
-    if (current.length >= prevLen) {
-      const victim = [...sections].sort((a, b) => a.priority - b.priority)[0];
-      if (!victim) break;
-      sections.splice(sections.indexOf(victim), 1);
-      current = renderSections(preamble, sections);
-    }
   }
   if (current.length <= maxChars) return current;
-  if (maxChars <= note.length) return current.slice(0, maxChars);
-  return `${current.slice(0, maxChars - note.length).trimEnd()}${note}`;
+  if (maxChars <= note.length) return safeSlicePrefix(current, maxChars);
+  return `${safeSlicePrefix(current, maxChars - note.length).trimEnd()}${note}`;
 }
 function ledgerRequests(span, config) {
   return renderSpan(span, config).length;
@@ -6676,9 +6741,12 @@ function tryLock(dir, lockFile = LOCK_FILE, staleMs = STALE_LOCK_MS) {
   const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
   if (createExclusiveLock(path2, token)) return makeRelease(path2, token);
   let mtimeMs;
+  let ino;
   let ownerToken;
   try {
-    mtimeMs = statSync(path2).mtimeMs;
+    const st = statSync(path2);
+    mtimeMs = st.mtimeMs;
+    ino = st.ino;
     ownerToken = readFileSync3(path2, "utf-8");
   } catch (error) {
     if (error.code === "ENOENT") {
@@ -6688,7 +6756,8 @@ function tryLock(dir, lockFile = LOCK_FILE, staleMs = STALE_LOCK_MS) {
   }
   if (Date.now() - mtimeMs <= staleMs) return void 0;
   try {
-    if (readFileSync3(path2, "utf-8") === ownerToken && statSync(path2).mtimeMs === mtimeMs) {
+    const current = statSync(path2);
+    if (current.ino === ino && current.mtimeMs === mtimeMs && readFileSync3(path2, "utf-8") === ownerToken) {
       rmSync2(path2, { force: true });
     }
   } catch {
@@ -6783,9 +6852,6 @@ function rebuildUnit(rows, mode, config) {
   }
   return out;
 }
-function unitChars(messages) {
-  return messages.reduce((n, m) => n + messageChars(m), 0);
-}
 
 // src/weights.ts
 var DEFAULT_THINKING_CHARS_PER_TOKEN = 4;
@@ -6854,11 +6920,11 @@ function thinkingChars(block) {
 function emptyHidden() {
   return { imageTokens: 0, thinkingChars: 0, images: [] };
 }
-function hasTextBlock(rowText, blockText) {
+function matchTextBlock(rowText, blockText, fromOffset = 0) {
   const trimmed = rowText.trim();
-  if (trimmed === blockText) return true;
-  if (!trimmed.includes("\n")) return false;
-  let idx = trimmed.indexOf(blockText);
+  if (fromOffset === 0 && trimmed === blockText) return { end: trimmed.length, consumedAll: true };
+  if (!trimmed.includes("\n")) return void 0;
+  let idx = trimmed.indexOf(blockText, fromOffset);
   while (idx !== -1) {
     let start = idx;
     while (start > 0 && trimmed[start - 1] !== "\n" && (trimmed[start - 1] === " " || trimmed[start - 1] === "	" || trimmed[start - 1] === "\r")) start--;
@@ -6866,10 +6932,13 @@ function hasTextBlock(rowText, blockText) {
     let end = idx + blockText.length;
     while (end < trimmed.length && trimmed[end] !== "\n" && (trimmed[end] === " " || trimmed[end] === "	" || trimmed[end] === "\r")) end++;
     const endOk = end === trimmed.length || trimmed[end] === "\n";
-    if (startOk && endOk) return true;
+    if (startOk && endOk) {
+      const next = end < trimmed.length && trimmed[end] === "\n" ? end + 1 : end;
+      return { end: next, consumedAll: next >= trimmed.length };
+    }
     idx = trimmed.indexOf(blockText, idx + 1);
   }
-  return false;
+  return void 0;
 }
 function isEmptyPrompt(m) {
   return m.role === "user" && !m.toolResults?.length && !m.text.trim();
@@ -6893,12 +6962,29 @@ function hiddenByRow(input, api) {
     for (const r of m.toolResults ?? []) resultRow.set(r.tool_use_id, i);
   });
   let cursor = 0;
+  let cursorOffset = 0;
+  const advanceCursor = (row, offset = 0) => {
+    if (row > cursor) {
+      cursor = row;
+      cursorOffset = offset;
+    } else if (row === cursor && offset > cursorOffset) {
+      cursorOffset = offset;
+    }
+  };
   const findForward = (test, from = cursor) => {
     for (let i = from; i < input.length; i++) if (test(input[i])) return i;
     return void 0;
   };
-  const assistantRowWithText = (text) => findForward((m) => m.role === "assistant" && hasTextBlock(m.text, text));
-  const promptRowWithText = (text) => findForward((m) => m.role === "user" && !m.toolResults?.length && hasTextBlock(m.text, text));
+  const findTextMatch = (role, text) => {
+    for (let i = cursor; i < input.length; i++) {
+      const m = input[i];
+      if (m.role !== role) continue;
+      if (role === "user" && m.toolResults?.length) continue;
+      const match = matchTextBlock(m.text, text, i === cursor ? cursorOffset : 0);
+      if (match) return { row: i, ...match };
+    }
+    return void 0;
+  };
   for (const message of api) {
     if (message.role === "assistant") {
       let pending = 0;
@@ -6906,16 +6992,18 @@ function hiddenByRow(input, api) {
       for (const block of message.content) {
         pending += thinkingChars(block);
         let row;
-        let advancePast = false;
         if (block.type === "tool_use") {
           row = callRow.get(String(block.id));
+          if (row !== void 0) advanceCursor(row);
         } else if (block.type === "text" && String(block.text ?? "").trim()) {
           const text = String(block.text).trim();
-          row = assistantRowWithText(text);
-          if (row !== void 0 && input[row].text.trim() === text) advancePast = true;
+          const hit = findTextMatch("assistant", text);
+          if (hit) {
+            row = hit.row;
+            advanceCursor(hit.consumedAll ? hit.row + 1 : hit.row, hit.consumedAll ? 0 : hit.end);
+          }
         }
         if (row === void 0) continue;
-        cursor = Math.max(cursor, advancePast ? row + 1 : row);
         last = row;
         if (pending) at(row).thinkingChars += pending;
         pending = 0;
@@ -6928,12 +7016,32 @@ function hiddenByRow(input, api) {
     }
     let promptAnchor;
     const pendingImages = [];
+    const afterAnchorImages = [];
+    const flushAfterAnchor = (limit) => {
+      if (promptAnchor === void 0 || !afterAnchorImages.length) return;
+      const emptyAfter = [];
+      for (let k = promptAnchor + 1; k < limit && isEmptyPrompt(input[k]); k++) emptyAfter.push(k);
+      if (!emptyAfter.length) {
+        for (const ref of afterAnchorImages) attachImage(promptAnchor, ref);
+      } else if (afterAnchorImages.length <= emptyAfter.length) {
+        afterAnchorImages.forEach((ref, idx) => attachImage(emptyAfter[idx], ref));
+        advanceCursor(emptyAfter[afterAnchorImages.length - 1] + 1);
+      } else {
+        const forAnchor = afterAnchorImages.length - emptyAfter.length;
+        for (let i = 0; i < forAnchor; i++) attachImage(promptAnchor, afterAnchorImages[i]);
+        emptyAfter.forEach((emptyRow, idx) => attachImage(emptyRow, afterAnchorImages[forAnchor + idx]));
+        advanceCursor(emptyAfter[emptyAfter.length - 1] + 1);
+      }
+      afterAnchorImages.length = 0;
+    };
     for (const block of message.content) {
       if (block.type === "tool_result") {
         const id = String(block.tool_use_id);
         const row = resultRow.get(id);
         if (row === void 0) continue;
-        cursor = Math.max(cursor, row);
+        flushAfterAnchor(row);
+        promptAnchor = void 0;
+        advanceCursor(row);
         const content = Array.isArray(block.content) ? block.content : [];
         for (const inner of content) {
           const ref = imageRef(inner, id);
@@ -6941,29 +7049,37 @@ function hiddenByRow(input, api) {
         }
       } else if (block.type === "text") {
         const text = String(block.text ?? "").trim();
-        const row = text ? promptRowWithText(text) : void 0;
-        if (row !== void 0) {
+        const hit = text ? findTextMatch("user", text) : void 0;
+        if (hit) {
           if (pendingImages.length) {
             const emptyBefore = [];
-            for (let k = row - 1; k >= cursor && isEmptyPrompt(input[k]); k--) emptyBefore.unshift(k);
+            for (let k = hit.row - 1; k >= cursor && isEmptyPrompt(input[k]); k--) emptyBefore.unshift(k);
             if (emptyBefore.length) {
               pendingImages.forEach((ref, idx) => attachImage(emptyBefore[Math.min(idx, emptyBefore.length - 1)], ref));
             } else {
-              for (const ref of pendingImages) attachImage(row, ref);
+              for (const ref of pendingImages) attachImage(hit.row, ref);
             }
             pendingImages.length = 0;
           }
-          promptAnchor = row;
-          const exact = input[row].text.trim() === text;
-          cursor = Math.max(cursor, exact ? row + 1 : row);
+          if (promptAnchor !== void 0 && afterAnchorImages.length) {
+            if (hit.row === promptAnchor) {
+              for (const ref of afterAnchorImages) attachImage(promptAnchor, ref);
+              afterAnchorImages.length = 0;
+            } else {
+              flushAfterAnchor(hit.row);
+            }
+          }
+          promptAnchor = hit.row;
+          advanceCursor(hit.consumedAll ? hit.row + 1 : hit.row, hit.consumedAll ? 0 : hit.end);
         }
       } else if (block.type === "image") {
         const ref = imageRef(block);
         if (!ref) continue;
-        if (promptAnchor !== void 0) attachImage(promptAnchor, ref);
+        if (promptAnchor !== void 0) afterAnchorImages.push(ref);
         else pendingImages.push(ref);
       }
     }
+    flushAfterAnchor(input.length);
     if (pendingImages.length) {
       const firstEmpty = findForward(isEmptyPrompt);
       if (firstEmpty !== void 0) {
@@ -6972,7 +7088,7 @@ function hiddenByRow(input, api) {
           emptyRows.push(k);
         }
         pendingImages.forEach((ref, idx) => attachImage(emptyRows[Math.min(idx, emptyRows.length - 1)], ref));
-        cursor = Math.max(cursor, emptyRows[emptyRows.length - 1] + 1);
+        advanceCursor(emptyRows[emptyRows.length - 1] + 1);
       }
     }
   }
@@ -7006,16 +7122,12 @@ function calibrateWeights(input, hidden, usage) {
   let calibratedThinking = DEFAULT_THINKING_CHARS_PER_TOKEN;
   if (thinking > 0) {
     const thinkingTokens = thinkingEst + residual * (vThink / vTotal);
-    if (thinkingTokens > 0) {
-      calibratedThinking = Math.min(RATIO_BOUNDS[1], Math.max(RATIO_BOUNDS[0], thinking / thinkingTokens));
-    }
+    calibratedThinking = thinkingTokens > 0 ? Math.min(RATIO_BOUNDS[1], Math.max(RATIO_BOUNDS[0], thinking / thinkingTokens)) : RATIO_BOUNDS[1];
   }
   let calibratedText = CHARS_PER_TOKEN;
   if (textChars >= 1e3) {
     const textTokens = textEst + residual * (vText / vTotal);
-    if (textTokens > 0) {
-      calibratedText = Math.min(TEXT_RATIO_BOUNDS[1], Math.max(TEXT_RATIO_BOUNDS[0], textChars / textTokens));
-    }
+    calibratedText = textTokens > 0 ? Math.min(TEXT_RATIO_BOUNDS[1], Math.max(TEXT_RATIO_BOUNDS[0], textChars / textTokens)) : TEXT_RATIO_BOUNDS[1];
   }
   return { thinkingRatio: calibratedThinking, charsPerToken: calibratedText };
 }
@@ -7029,7 +7141,6 @@ function calibratedTextChars(rawChars, charsPerToken) {
 }
 
 // src/compact.ts
-var HEADER_MARK = "[strata: compacted conversation]";
 var DeclineError = class extends Error {
 };
 var OversizeError = class extends DeclineError {
@@ -7063,7 +7174,7 @@ function reconcile(dir, input, state) {
     if (state.lastOutput[i].seq >= 0) inputBySeq.set(state.lastOutput[i].seq, i);
   }
   const fresh = input.map((_, i) => i).slice(matched).filter((i) => !input[i].text.startsWith(HEADER_MARK));
-  const nextSeq = archive.length ? Math.max(archive.length, archive[archive.length - 1].seq + 1) : 0;
+  const nextSeq = archive.reduce((max, m) => Math.max(max, m.seq + 1), archive.length);
   const pending = numberMessages(nextSeq, fresh.map((i) => input[i]));
   fresh.forEach((inputIndex, k) => inputBySeq.set(pending[k].seq, inputIndex));
   const all = [...archive, ...pending];
@@ -7087,7 +7198,7 @@ function buildHeader(input, dir, evicted, ledger, ledgerThrough, config) {
   const pinned = evicted.find(isPrompt3);
   const sections = [headerPreamble(input, dir)];
   if (pinned) sections.push(`## Original request (seq ${pinned.seq})
-${pinned.text.slice(0, shareChars(config, "pinned"))}`);
+${safeSlicePrefix(pinned.text, shareChars(config, "pinned"))}`);
   if (ledger) {
     const lag = ledgerThrough < evicted.length ? `
 
@@ -7123,7 +7234,7 @@ function layout(verbatim, masked, protectedFrom, headerAt, budget, config) {
     return start;
   };
   const fitsWithoutEviction = sum(masked, 0, protectedFrom) + sum(verbatim, protectedFrom, verbatim.length) <= budget;
-  let h = fitsWithoutEviction ? 0 : headerAt(Math.max(1, protectedFrom));
+  let h = fitsWithoutEviction || protectedFrom === 0 ? 0 : headerAt(protectedFrom);
   let tail = protectedFrom;
   let cut2 = 0;
   for (let iter = 0; iter < 4; iter++) {
@@ -7155,6 +7266,12 @@ function layout(verbatim, masked, protectedFrom, headerAt, budget, config) {
     const candidate = cut2 - 1;
     const nextTotal = (candidate > 0 ? headerAt(candidate) : 0) + sum(masked, candidate, tail) + sum(verbatim, tail, verbatim.length);
     if (nextTotal <= budget) cut2 = candidate;
+    else break;
+  }
+  while (cut2 === 0 && tail > 0) {
+    const nextTailUsed = sum(verbatim, tail - 1, verbatim.length);
+    const nextTotal = sum(masked, 0, tail - 1) + nextTailUsed;
+    if (nextTotal <= budget && nextTailUsed <= budget - middleFloor) tail--;
     else break;
   }
   return { cut: cut2, tail };
@@ -7205,15 +7322,24 @@ function chooseLedgerWork(base, rows, cutRow, config, focus, enforceMinChars) {
       chunks = fullChunks;
       nextAge = 0;
     } else {
+      const maskCfg = ledgerMaskConfig(config);
       const capChars = maxChunks * config.ledgerChunkChars;
       let start = fullSpan.length;
       let acc = 0;
-      while (start > 0 && acc + messageChars(fullSpan[start - 1]) <= capChars) {
+      while (start > 0) {
+        const m = fullSpan[start - 1];
+        const len = renderMessage(maskMessage(m, m.seq, maskCfg), m.seq).length + 1;
+        if (acc > 0 && acc + len > capChars) break;
         start--;
-        acc += messageChars(fullSpan[start]);
+        acc += len;
       }
-      span = fullSpan.slice(Math.min(start, fullSpan.length - 1));
-      chunks = renderSpan(span, config).slice(-maxChunks);
+      span = fullSpan.slice(start);
+      chunks = renderSpan(span, config);
+      while (chunks.length > maxChunks && span.length > 1) {
+        span = span.slice(1);
+        chunks = renderSpan(span, config);
+      }
+      if (chunks.length > maxChunks) chunks = chunks.slice(-maxChunks);
       nextAge = base.ledgerAge + 1;
     }
   } else {
@@ -7281,25 +7407,50 @@ function planCompaction(input, config, reserveFullLedger) {
   }
   const rawBuilt = units.map((u) => rebuildUnit(rows.slice(u.start, u.end), "raw", config));
   const maskedBuilt = units.map((u) => rebuildUnit(rows.slice(u.start, u.end), "masked", config));
-  const maskedSizes = maskedBuilt.map(unitChars);
+  const scaledMessagesChars = (msgs) => msgs.reduce((n, m) => n + calibratedTextChars(messageChars(m), charsPerToken), 0);
+  const maskedSizes = maskedBuilt.map(scaledMessagesChars);
   const rowChars = (m) => calibratedTextChars(messageChars(m), charsPerToken) + hiddenChars(hidden.get(inputBySeq.get(m.seq)), ratio);
-  const verbatim = units.map((u, k) => whole[k] ? rows.slice(u.start, u.end).reduce((n, m) => n + rowChars(m), 0) : unitChars(rawBuilt[k]));
+  const verbatim = units.map((u, k) => whole[k] ? rows.slice(u.start, u.end).reduce((n, m) => n + rowChars(m), 0) : scaledMessagesChars(rawBuilt[k]));
   const base = bestLedger(dir, state, rows, ledgerStale);
   const budget = budgetChars(config);
   const ledgerCap = shareChars(config, "ledger");
-  const fullReserve = reserveFullLedger ?? (input.ledgerMode !== "ready" || input.preparedLedger !== void 0);
-  const preferredLedgerChars = fullReserve ? ledgerCap : Math.min(base.ledger.length, ledgerCap);
+  const provided = input.preparedLedger;
+  const adoptedLedger = provided && provided.through <= rows.length && prefixHash(rows, provided.through) === provided.prefixHash ? {
+    ledger: trimLedger(provided.ledger, ledgerCap),
+    ledgerThrough: provided.through,
+    ledgerAge: provided.age,
+    requests: provided.requests
+  } : void 0;
+  const knownLedger = adoptedLedger ?? base;
+  const ledgerKnown = adoptedLedger !== void 0 || input.ledgerError !== void 0 || input.ledgerMode === "ready";
+  const fullReserve = reserveFullLedger ?? !ledgerKnown;
+  const preferredLedgerChars = fullReserve ? ledgerCap : Math.min(knownLedger.ledger.length, ledgerCap);
   const makeHeaderSizer = (ledgerChars) => {
     const cache = /* @__PURE__ */ new Map();
     const placeholder = ledgerChars > 0 ? "x".repeat(ledgerChars) : "";
+    const indexCap = shareChars(config, "index");
     return (cut2) => {
       if (cut2 <= 0) return 0;
       const hit = cache.get(cut2);
       if (hit !== void 0) return hit;
       const evicted = rows.slice(0, units[cut2].start);
-      let size = buildHeader(input, dir, evicted, placeholder, base.ledgerThrough, config).length;
-      if (fullReserve) {
-        size = Math.max(size, buildHeader(input, dir, evicted, placeholder, evicted.length, config).length);
+      if (!fullReserve) {
+        const size2 = buildHeader(input, dir, evicted, placeholder, knownLedger.ledgerThrough, config).length;
+        cache.set(cut2, size2);
+        return size2;
+      }
+      const episodes = segmentEpisodes(evicted);
+      const fullIdxLen = episodes.map(renderEpisode).join("\n").length;
+      const baseProtect = base.ledgerThrough < evicted.length ? evicted[base.ledgerThrough]?.seq : void 0;
+      const baseIdxLen = renderIndex(episodes, indexCap, { protectAfterSeq: baseProtect }).length;
+      const indexSlack = fullIdxLen > indexCap ? Math.max(0, indexCap - baseIdxLen) : 0;
+      let size = buildHeader(input, dir, evicted, placeholder, base.ledgerThrough, config).length + indexSlack;
+      if (placeholder && base.ledgerThrough < evicted.length && evicted.length > 1) {
+        const maxLagHeader = buildHeader(input, dir, evicted, placeholder, evicted.length - 1, config).length;
+        const lagProtect = evicted[evicted.length - 1]?.seq;
+        const lagIdxLen = renderIndex(episodes, indexCap, { protectAfterSeq: lagProtect }).length;
+        const lagSlack = fullIdxLen > indexCap ? Math.max(0, indexCap - lagIdxLen) : 0;
+        size = Math.max(size, maxLagHeader + lagSlack);
       }
       cache.set(cut2, size);
       return size;
@@ -7322,11 +7473,13 @@ function planCompaction(input, config, reserveFullLedger) {
     reconciled,
     rows,
     base,
+    ...adoptedLedger ? { adoptedLedger } : {},
     units,
     handles,
     whole,
     rawBuilt,
     maskedBuilt,
+    maskedSizes,
     verbatim,
     ...picked,
     cutRow: units[picked.cut].start
@@ -7337,19 +7490,32 @@ async function compact(input, config, ledgerFn = updateLedger) {
   const release = await acquireLock(dir, "compact.lock");
   try {
     const plan = planCompaction(input, config);
-    const { state, rows, base, units, handles, whole, rawBuilt, maskedBuilt, verbatim, cut: cut2, tail, cutRow, hidden, ratio, charsPerToken, mediaWrites } = plan;
+    const {
+      state,
+      rows,
+      base,
+      adoptedLedger,
+      units,
+      handles,
+      whole,
+      rawBuilt,
+      maskedBuilt,
+      maskedSizes,
+      verbatim,
+      cut: cut2,
+      tail,
+      cutRow,
+      hidden,
+      ratio,
+      charsPerToken,
+      mediaWrites
+    } = plan;
     const { all, pending, branch, matched } = plan.reconciled;
     const tailRow = units[tail].start;
     const budget = budgetChars(config);
     let ledger;
-    const provided = input.preparedLedger;
-    if (provided && provided.through <= rows.length && prefixHash(rows, provided.through) === provided.prefixHash) {
-      ledger = {
-        ledger: trimLedger(provided.ledger, shareChars(config, "ledger")),
-        ledgerThrough: provided.through,
-        ledgerAge: provided.age,
-        requests: provided.requests
-      };
+    if (adoptedLedger) {
+      ledger = adoptedLedger;
     } else if (input.ledgerError) {
       ledger = { ...base, error: input.ledgerError };
     } else if (input.ledgerMode === "ready") {
@@ -7363,8 +7529,14 @@ async function compact(input, config, ledgerFn = updateLedger) {
     let tailHidden = 0;
     const emitBuilt = (m, upto, layer) => {
       entries.push({ built: m });
-      records.push({ fp: fingerprint(m), upto, seq: -1 });
-      layers[layer] += messageChars(m);
+      records.push({
+        fp: fingerprint(m),
+        upto,
+        seq: -1,
+        role: m.role,
+        ...layer === "header" ? { isHeader: true } : {}
+      });
+      layers[layer] += layer === "header" ? messageChars(m) : calibratedTextChars(messageChars(m), charsPerToken);
     };
     const body = [];
     for (let u = cut2; u < tail; u++) {
@@ -7376,7 +7548,12 @@ async function compact(input, config, ledgerFn = updateLedger) {
         handles[u].forEach((inputIndex, k) => {
           body.push(() => {
             entries.push({ keep: inputIndex });
-            records.push({ fp: fingerprint(input.messages[inputIndex]), upto: start + k + 1, seq: rows[start + k].seq });
+            records.push({
+              fp: fingerprint(input.messages[inputIndex]),
+              upto: start + k + 1,
+              seq: rows[start + k].seq,
+              role: rows[start + k].role
+            });
             const extra = hiddenChars(hidden.get(inputIndex), ratio);
             tailHidden += extra;
             layers.tail += calibratedTextChars(messageChars(rows[start + k]), charsPerToken) + extra;
@@ -7388,7 +7565,7 @@ async function compact(input, config, ledgerFn = updateLedger) {
     }
     if (cutRow > 0) {
       const evicted = rows.slice(0, cutRow);
-      const bodyChars = maskedBuilt.slice(cut2, tail).reduce((n, b) => n + unitChars(b), 0) + verbatim.slice(tail).reduce((a, b) => a + b, 0);
+      const bodyChars = maskedSizes.slice(cut2, tail).reduce((a, b) => a + b, 0) + verbatim.slice(tail).reduce((a, b) => a + b, 0);
       const emptyHeader = buildHeader(input, dir, evicted, "", ledger.ledgerThrough, config).length;
       const probeHeader = buildHeader(input, dir, evicted, "x", ledger.ledgerThrough, config).length;
       const ledgerWrapper = probeHeader - emptyHeader - 1;
@@ -7498,6 +7675,33 @@ async function prepare(input, config, ledgerFn = updateLedger) {
 // src/query.ts
 import { existsSync as existsSync4, readdirSync, statSync as statSync2 } from "fs";
 import { join as join6 } from "path";
+function renderArchived(m) {
+  const parts = [];
+  const body = renderMessage(m, m.seq);
+  if (body) parts.push(body);
+  if (m.media?.length) {
+    parts.push(`#${m.seq} media: ${m.media.map((r) => r.path).join(", ")}`);
+  }
+  if (!parts.length) {
+    parts.push(`#${m.seq} ${m.role}: (empty or non-text message)`);
+  }
+  return parts.join("\n");
+}
+function adjustSliceBounds(text, start, end) {
+  let s = start;
+  let e = end;
+  if (s > 0 && s < text.length) {
+    const c = text.charCodeAt(s);
+    if (c >= 56320 && c <= 57343) s++;
+  }
+  if (e > s && e < text.length) {
+    const c = text.charCodeAt(e - 1);
+    if (c >= 55296 && c <= 56319) {
+      e = e - 1 > s ? e - 1 : Math.min(text.length, e + 1);
+    }
+  }
+  return [s, e];
+}
 function showArchive(dir, options) {
   const from = options.from;
   const to = options.to ?? from;
@@ -7515,7 +7719,7 @@ function showArchive(dir, options) {
       text: ""
     };
   }
-  const full = picked.map((m) => renderMessage(m, m.seq)).join("\n\n");
+  const full = picked.map(renderArchived).join("\n\n");
   const offset = Math.max(0, Math.floor(options.offset ?? 0));
   const limit = options.limit !== void 0 && options.limit > 0 ? Math.floor(options.limit) : void 0;
   if (offset >= full.length) {
@@ -7530,18 +7734,19 @@ function showArchive(dir, options) {
       text: `[strata show: offset ${offset} is past end of output (${full.length} chars)]`
     };
   }
-  const slice = limit !== void 0 ? full.slice(offset, offset + limit) : full.slice(offset);
-  const end = offset + slice.length;
+  const rawEnd = limit !== void 0 ? Math.min(full.length, offset + limit) : full.length;
+  const [sliceStart, end] = adjustSliceBounds(full, offset, rawEnd);
+  const slice = full.slice(sliceStart, end);
   const hasMore = end < full.length;
   const footer = hasMore || offset > 0 ? `
 
-[strata show: chars ${offset}-${end} of ${full.length}${hasMore ? `; pass offset=${end} to continue` : " (end)"}]` : "";
+[strata show: chars ${sliceStart}-${end} of ${full.length}${hasMore ? `; pass offset=${end} to continue` : " (end)"}]` : "";
   return {
     found: true,
     archiveCount: archive.length,
     seqs: picked.map((m) => m.seq),
     totalChars: full.length,
-    offset,
+    offset: sliceStart,
     returnedChars: slice.length,
     hasMore,
     ...hasMore ? { nextOffset: end } : {},
@@ -7550,8 +7755,7 @@ function showArchive(dir, options) {
 }
 function makeSnippet(rendered, index, matchLen, contextChars) {
   const half = Math.max(20, Math.floor(contextChars / 2));
-  const start = Math.max(0, index - half);
-  const end = Math.min(rendered.length, index + matchLen + half);
+  const [start, end] = adjustSliceBounds(rendered, Math.max(0, index - half), Math.min(rendered.length, index + matchLen + half));
   const body = rendered.slice(start, end).replace(/\s+/g, " ").trim();
   return `${start > 0 ? "\u2026" : ""}${body}${end < rendered.length ? "\u2026" : ""}`;
 }
@@ -7595,7 +7799,7 @@ function searchArchive(dir, options) {
   const matches = [];
   let totalMatches = 0;
   for (const m of candidates) {
-    const rendered = renderMessage(m, m.seq);
+    const rendered = renderArchived(m);
     const hit = matcher(rendered);
     if (!hit) continue;
     totalMatches++;
@@ -7629,7 +7833,7 @@ function sessionStatus(dir, sessionKey) {
   const bySeq = new Map(archive.map((m) => [m.seq, m]));
   const rows = state.branch.map((seq) => bySeq.get(seq)).filter((m) => m !== void 0);
   const ready = readReady(dir);
-  const readyCompatible = ready !== void 0 && ready.through <= rows.length && prefixHash(rows, ready.through) === ready.prefixHash;
+  const readyStatus = ready ? ready.through > rows.length ? "pending" : prefixHash(rows, ready.through) === ready.prefixHash ? "compatible" : "stale" : void 0;
   const ledgerLag = state.lastCut !== void 0 ? Math.max(0, state.lastCut - state.ledgerThrough) : 0;
   return {
     sessionKey,
@@ -7643,13 +7847,14 @@ function sessionStatus(dir, sessionKey) {
     ledgerChars: state.ledger.length,
     ledgerAge: state.ledgerAge,
     ledgerLag,
-    ...ready ? {
+    ...ready && readyStatus ? {
       readyLedger: {
         through: ready.through,
         chars: ready.ledger.length,
         age: ready.age,
         preparedAt: ready.preparedAt,
-        compatible: readyCompatible
+        compatible: readyStatus === "compatible",
+        status: readyStatus
       }
     } : {}
   };
@@ -7657,7 +7862,7 @@ function sessionStatus(dir, sessionKey) {
 function formatSessionStatus(s) {
   const kb = (s.archiveBytes / 1024).toFixed(1);
   const ledgerLine = s.ledgerChars > 0 ? `ledger: ${s.ledgerChars.toLocaleString("en-US")} chars, covers ${s.ledgerThrough} rows (age ${s.ledgerAge}${s.ledgerLag > 0 ? `, lags cut by ${s.ledgerLag} rows` : s.lastCut !== void 0 ? ", up to date" : ""})` : `ledger: empty${s.ledgerLag > 0 ? ` (lags cut by ${s.ledgerLag} rows)` : ""}`;
-  const readyLine = s.readyLedger ? `ready ledger: ${s.readyLedger.chars.toLocaleString("en-US")} chars, covers ${s.readyLedger.through} rows (${s.readyLedger.compatible ? "compatible" : "stale"}, prepared ${s.readyLedger.preparedAt})` : "ready ledger: none";
+  const readyLine = s.readyLedger ? `ready ledger: ${s.readyLedger.chars.toLocaleString("en-US")} chars, covers ${s.readyLedger.through} rows (${s.readyLedger.status}, prepared ${s.readyLedger.preparedAt})` : "ready ledger: none";
   return [
     `archive: ${s.archiveCount} messages (${kb} KB), ${s.mediaCount} media files, active branch ${s.branchLength} rows`,
     `compactions: ${s.compactions}${s.lastCut !== void 0 ? ` (last cut at row ${s.lastCut})` : ""}`,
@@ -7791,11 +7996,12 @@ async function runCompact(argv) {
   if (values.ledger !== void 0 && values.ledger !== "sync" && values.ledger !== "ready") fail(`--ledger must be sync or ready, got ${values.ledger}`);
   const config = loadConfig(budgetOverride(values.budget));
   const payload = readJsonInput(values.in);
+  const instructions = values.instructions ?? payload.instructions;
   const result = await compact(
     {
       sessionKey: values.session,
       messages: payload.messages,
-      ...values.instructions ? { instructions: values.instructions } : {},
+      ...instructions ? { instructions } : {},
       ...values.ledger ? { ledgerMode: values.ledger } : {},
       ...values["native-tools"] ? { hasNativeTools: true } : {},
       ...payload.api ? { api: payload.api } : {},
@@ -7834,14 +8040,15 @@ async function runPrepare(argv) {
 `);
     return;
   }
-  const { messages, api, usage } = readJsonInput(values.in);
+  const { messages, instructions: bodyInstructions, api, usage } = readJsonInput(values.in);
+  const instructions = values.instructions ?? bodyInstructions;
   const result = await prepare(
     {
       sessionKey: values.session,
       messages,
       ...api ? { api } : {},
       ...usage ? { usage } : {},
-      ...values.instructions ? { instructions: values.instructions } : {},
+      ...instructions ? { instructions } : {},
       showCommand: SHOW_COMMAND(values.session)
     },
     config
@@ -7875,14 +8082,15 @@ function runLedgerPlan(argv) {
 `);
     return;
   }
-  const { messages, api, usage } = readJsonInput(values.in);
+  const { messages, instructions: bodyInstructions, api, usage } = readJsonInput(values.in);
+  const instructions = values.instructions ?? bodyInstructions;
   const plan = planLedger(
     {
       sessionKey: values.session,
       messages,
       ...api ? { api } : {},
       ...usage ? { usage } : {},
-      ...values.instructions ? { instructions: values.instructions } : {},
+      ...instructions ? { instructions } : {},
       showCommand: SHOW_COMMAND(values.session)
     },
     config,
@@ -7912,6 +8120,19 @@ function runLedgerSave(argv) {
     process.stdout.write(`${JSON.stringify({ saved: false, reason: "already saved for this prefix", through: existing.through })}
 `);
     return;
+  }
+  if (existing && existing.through > payload.through) {
+    const state = readState(dir);
+    if (state.branch.length >= existing.through) {
+      const archive = readArchive(dir);
+      const bySeq = new Map(archive.map((m) => [m.seq, m]));
+      const rows = state.branch.map((seq) => bySeq.get(seq)).filter((m) => m !== void 0);
+      if (existing.through <= rows.length && prefixHash(rows, existing.through) === existing.prefixHash && payload.through <= rows.length && prefixHash(rows, payload.through) === payload.prefixHash) {
+        process.stdout.write(`${JSON.stringify({ saved: false, reason: "existing ready ledger covers further on this branch", through: existing.through })}
+`);
+        return;
+      }
+    }
   }
   writeReady(dir, {
     ledger: trimLedger(payload.ledger, shareChars(config, "ledger")),
@@ -8021,72 +8242,81 @@ async function runReplay(argv) {
   const path2 = positionals[0];
   if (!path2) fail("replay needs a transcript path");
   const dataDir = mkdtempSync(join7(tmpdir(), "strata-replay-"));
-  const config = loadConfig({ dataDir, ...budgetOverride(values.budget) });
-  const trigger = values.trigger ? parseIntArg("--trigger", values.trigger, 1) : config.budgetTokens * 2;
-  const key = `replay-${basename(path2, ".jsonl")}`;
-  const { messages: raw, blocks } = readTranscriptWithBlocks(path2);
-  const weight = /* @__PURE__ */ new Map();
-  const tokensOf = (m) => {
-    let w = weight.get(m);
-    if (w === void 0) {
-      const hidden = hiddenByRow([m], apiForm([m], blocks)).get(0);
-      w = estimateTokens(messageChars(m)) + (hidden ? hidden.imageTokens + Math.round(hidden.thinkingChars / DEFAULT_THINKING_CHARS_PER_TOKEN) : 0);
-      weight.set(m, w);
+  try {
+    const config = loadConfig({ dataDir, ...budgetOverride(values.budget) });
+    const trigger = values.trigger ? parseIntArg("--trigger", values.trigger, 1) : config.budgetTokens * 2;
+    const key = `replay-${basename(path2, ".jsonl")}`;
+    const { messages: raw, blocks } = readTranscriptWithBlocks(path2);
+    const weight = /* @__PURE__ */ new Map();
+    const tokensOf = (m) => {
+      let w = weight.get(m);
+      if (w === void 0) {
+        const hidden = hiddenByRow([m], apiForm([m], blocks)).get(0);
+        w = estimateTokens(messageChars(m)) + (hidden ? hidden.imageTokens + Math.round(hidden.thinkingChars / DEFAULT_THINKING_CHARS_PER_TOKEN) : 0);
+        weight.set(m, w);
+      }
+      return w;
+    };
+    const tokens = (ms) => ms.reduce((n, m) => n + tokensOf(m), 0);
+    process.stdout.write(`${raw.length} messages, ${tokens(raw).toLocaleString("en-US")} est. tokens raw; budget ${config.budgetTokens}, trigger ${trigger}
+`);
+    const ledgerFn = values["no-llm"] ? noLedger : void 0;
+    const PREPARE_HEADROOM_TOKENS = 1e5;
+    const prepareAt = Math.max(Math.round(trigger / 2), trigger - PREPARE_HEADROOM_TOKENS);
+    let live = [];
+    let compactions = 0;
+    let preparedThisCycle = false;
+    for (const m of raw) {
+      live.push(m);
+      const size = tokens(live);
+      if (values.background && size >= prepareAt && size < trigger && !preparedThisCycle) {
+        preparedThisCycle = true;
+        try {
+          const prepared = await prepare(
+            { sessionKey: key, messages: live, api: apiForm(live, blocks), showCommand: SHOW_COMMAND(key) },
+            config,
+            ledgerFn
+          );
+          process.stdout.write(`   prepare at ${Math.round(size / 1e3)}k: ${JSON.stringify(prepared)}
+`);
+        } catch (error) {
+          if (!(error instanceof DeclineError)) throw error;
+          process.stdout.write(`   prepare declined at ${Math.round(size / 1e3)}k: ${error.message}
+`);
+        }
+      }
+      if (size < trigger) continue;
+      preparedThisCycle = false;
+      let result;
+      try {
+        result = await compact(
+          { sessionKey: key, messages: live, api: apiForm(live, blocks), showCommand: SHOW_COMMAND(key), ...values.background ? { ledgerMode: "ready" } : {} },
+          config,
+          ledgerFn
+        );
+      } catch (error) {
+        if (!(error instanceof DeclineError)) throw error;
+        process.stdout.write(`#${compactions + 1} declined, stopping: ${error.message}
+`);
+        break;
+      }
+      live = result.entries.map((e) => "keep" in e ? live[e.keep] : e.built);
+      compactions++;
+      process.stdout.write(`#${compactions} ${summarize(result.stats)}
+`);
+      if (values.background && result.stats.ledgerThrough < result.stats.cut) {
+        const caught = await prepare({ sessionKey: key, through: result.stats.cut }, config, ledgerFn);
+        process.stdout.write(`   catch-up: ${JSON.stringify(caught)}
+`);
+      }
     }
-    return w;
-  };
-  const tokens = (ms) => ms.reduce((n, m) => n + tokensOf(m), 0);
-  process.stdout.write(`${raw.length} messages, ${tokens(raw).toLocaleString("en-US")} est. tokens raw; budget ${config.budgetTokens}, trigger ${trigger}
+    process.stdout.write(`end: live ${tokens(live).toLocaleString("en-US")} est. tokens after ${compactions} compactions
 `);
-  const ledgerFn = values["no-llm"] ? noLedger : void 0;
-  const PREPARE_HEADROOM_TOKENS = 1e5;
-  const prepareAt = Math.max(Math.round(trigger / 2), trigger - PREPARE_HEADROOM_TOKENS);
-  let live = [];
-  let compactions = 0;
-  let preparedThisCycle = false;
-  for (const m of raw) {
-    live.push(m);
-    const size = tokens(live);
-    if (values.background && size >= prepareAt && size < trigger && !preparedThisCycle) {
-      preparedThisCycle = true;
-      const prepared = await prepare(
-        { sessionKey: key, messages: live, api: apiForm(live, blocks), showCommand: SHOW_COMMAND(key) },
-        config,
-        ledgerFn
-      );
-      process.stdout.write(`   prepare at ${Math.round(size / 1e3)}k: ${JSON.stringify(prepared)}
+  } finally {
+    if (values.keep) process.stdout.write(`data kept in ${dataDir}
 `);
-    }
-    if (size < trigger) continue;
-    preparedThisCycle = false;
-    let result;
-    try {
-      result = await compact(
-        { sessionKey: key, messages: live, api: apiForm(live, blocks), showCommand: SHOW_COMMAND(key), ...values.background ? { ledgerMode: "ready" } : {} },
-        config,
-        ledgerFn
-      );
-    } catch (error) {
-      if (!(error instanceof DeclineError)) throw error;
-      process.stdout.write(`#${compactions + 1} declined, stopping: ${error.message}
-`);
-      break;
-    }
-    live = result.entries.map((e) => "keep" in e ? live[e.keep] : e.built);
-    compactions++;
-    process.stdout.write(`#${compactions} ${summarize(result.stats)}
-`);
-    if (values.background && result.stats.ledgerThrough < result.stats.cut) {
-      const caught = await prepare({ sessionKey: key, through: result.stats.cut }, config, ledgerFn);
-      process.stdout.write(`   catch-up: ${JSON.stringify(caught)}
-`);
-    }
+    else rmSync3(dataDir, { recursive: true, force: true });
   }
-  process.stdout.write(`end: live ${tokens(live).toLocaleString("en-US")} est. tokens after ${compactions} compactions
-`);
-  if (values.keep) process.stdout.write(`data kept in ${dataDir}
-`);
-  else rmSync3(dataDir, { recursive: true, force: true });
 }
 var [command, ...rest] = process.argv.slice(2);
 var commands = {

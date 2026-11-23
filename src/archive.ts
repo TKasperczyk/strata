@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, truncateSync, writeFileSync } from 'fs'
 import { createHash } from 'crypto'
 import { join } from 'path'
-import type { ArchivedMessage, Message, OutputRecord, SessionState } from './types.js'
+import { HEADER_MARK, type ArchivedMessage, type Message, type OutputRecord, type SessionState } from './types.js'
 
 export const INITIAL_STATE: SessionState = {
   branch: [],
@@ -56,23 +56,40 @@ export function numberMessages(start: number, messages: Message[]): ArchivedMess
   return messages.map((m, i) => ({ ...m, seq: start + i }))
 }
 
-/** Trim any incomplete/corrupt trailing line before appending so the JSONL file self-heals. */
+/** Trim any incomplete/corrupt trailing lines before appending so the JSONL file self-heals. */
 function repairTrailingLine(path: string): void {
   if (!existsSync(path)) return
   const raw = readFileSync(path)
   if (raw.length === 0) return
   let end = raw.length
-  while (end > 0 && (raw[end - 1] === 0x0a || raw[end - 1] === 0x0d)) end--
-  const lastNl = raw.lastIndexOf(0x0a, Math.max(0, end - 1))
-  const lastLine = raw.subarray(lastNl + 1, end).toString('utf-8').trim()
-  if (!lastLine) return
-  try {
-    const parsed: unknown = JSON.parse(lastLine)
-    if (!isArchivedMessage(parsed)) throw new Error('invalid archive row')
-    if (raw[raw.length - 1] !== 0x0a) appendFileSync(path, '\n')
-  } catch {
-    truncateSync(path, lastNl >= 0 ? lastNl + 1 : 0)
+  let truncated = false
+  while (end > 0) {
+    let lineEnd = end
+    while (lineEnd > 0 && (raw[lineEnd - 1] === 0x0a || raw[lineEnd - 1] === 0x0d)) lineEnd--
+    if (lineEnd === 0) {
+      end = 0
+      truncated = true
+      break
+    }
+    const lastNl = raw.lastIndexOf(0x0a, lineEnd - 1)
+    const lineStart = lastNl >= 0 ? lastNl + 1 : 0
+    const text = raw.subarray(lineStart, lineEnd).toString('utf-8').trim()
+    if (!text) {
+      end = lineStart
+      truncated = true
+      continue
+    }
+    try {
+      const parsed: unknown = JSON.parse(text)
+      if (!isArchivedMessage(parsed)) throw new Error('invalid archive row')
+      break
+    } catch {
+      end = lineStart
+      truncated = true
+    }
   }
+  if (truncated) truncateSync(path, end)
+  if (end > 0 && raw[end - 1] !== 0x0a) appendFileSync(path, '\n')
 }
 
 export function appendArchive(dir: string, archived: ArchivedMessage[]): void {
@@ -86,7 +103,13 @@ export function appendArchive(dir: string, archived: ArchivedMessage[]): void {
 function isOutputRecord(v: unknown): v is OutputRecord {
   if (!v || typeof v !== 'object' || Array.isArray(v)) return false
   const r = v as Partial<OutputRecord>
-  return typeof r.fp === 'string' && typeof r.upto === 'number' && typeof r.seq === 'number'
+  return (
+    typeof r.fp === 'string' &&
+    typeof r.upto === 'number' &&
+    typeof r.seq === 'number' &&
+    (r.role === undefined || r.role === 'user' || r.role === 'assistant') &&
+    (r.isHeader === undefined || r.isHeader === true)
+  )
 }
 
 /** Read session state, falling back cleanly to INITIAL_STATE if corrupt. */
@@ -179,9 +202,12 @@ export function matchedPrefix(input: Message[], state: SessionState): number {
       p++
       continue
     }
+    const rec = out[p]
+    const roleMatches = rec.role === undefined || input[p].role === rec.role
+    const headerMatches = !rec.isHeader || input[p].text.includes(HEADER_MARK)
     const tailIntact = hasKeptFrom[p + 1] && keptMatchFrom[p + 1]
     const fallbackIntact = !hasKeptFrom[0] && p + 1 < out.length && restSame[p + 1]
-    if (out[p].seq === -1 && (tailIntact || fallbackIntact)) {
+    if (rec.seq === -1 && roleMatches && headerMatches && (tailIntact || fallbackIntact)) {
       p++
       continue
     }
