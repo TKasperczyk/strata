@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { EngineInterface, ModelCompleteRequest, ModelCompleteResult, Next, ProcessRunResult, SessionMessage } from 'claude-code'
-import { strataCompact } from './register'
+import { prepareLedger, strataCompact } from './register'
 
 const SESSION = 'sess-1'
 const MESSAGES: SessionMessage[] = [
@@ -110,8 +110,7 @@ describe('strataCompact', () => {
       'node',
       '/plugins/strata/plugin/bin/strata.mjs',
       'compact',
-      '--session',
-      SESSION,
+      `--session=${SESSION}`,
       '--in',
       '-',
       '--out',
@@ -418,5 +417,50 @@ describe('strataCompact', () => {
     expect(models[1]?.prompt).toContain('CRITICAL_STATE_ALIVE')
     expect(models[1]?.prompt).toContain('CRITICAL_TODO_ALIVE')
     expect(models[1]?.prompt).not.toContain('Old dead end 0 ')
+  })
+
+  test('clamps plan.maxTokens to [1, 64_000] before calling $.model.complete', async () => {
+    const stdout = JSON.stringify({ entries: [{ keep: 2 }], stats: { rawChars: 7000, outputChars: 3500, matched: 0, previousOutput: 0, cut: 2, ledgerThrough: 2 } })
+    const runWithMaxTokens = async (rawMaxTokens: number) => {
+      const models: ModelCompleteRequest[] = []
+      const engine = fakeEngine(cli(stdout), [], [], models, {
+        onRun: argv =>
+          argv.includes('ledger-plan') ? cli(JSON.stringify({ ...SAMPLE_PLAN, maxTokens: rawMaxTokens })) : cli(stdout)
+      })
+      await strataCompact(engine, { trigger: 'manual', messages: MESSAGES }, builtIn, SESSION)
+      return models[0]?.maxTokens
+    }
+
+    expect(await runWithMaxTokens(120_000)).toBe(64_000)
+    expect(await runWithMaxTokens(64_001)).toBe(64_000)
+    expect(await runWithMaxTokens(64_000)).toBe(64_000)
+    expect(await runWithMaxTokens(2_500.9)).toBe(2_500)
+    expect(await runWithMaxTokens(0)).toBe(1)
+    expect(await runWithMaxTokens(-50)).toBe(1)
+  })
+
+  test('passes --session=<key> across ledger-plan, ledger-save, and compact for leading-dash session keys', async () => {
+    const dashSession = '-sess-with-leading-dash'
+    const calls: Call[] = []
+    const models: ModelCompleteRequest[] = []
+    const stdout = JSON.stringify({ entries: [{ keep: 2 }], stats: { rawChars: 7000, outputChars: 3500, matched: 0, previousOutput: 0, cut: 2, ledgerThrough: 2 } })
+    const engine = fakeEngine(cli(stdout), calls, [], models, {
+      withSession: true,
+      onRun: argv => {
+        if (argv.includes('ledger-plan')) return cli(JSON.stringify(SAMPLE_PLAN))
+        if (argv.includes('ledger-save')) return cli(JSON.stringify({ saved: true, through: 2 }))
+        return cli(stdout)
+      }
+    })
+
+    await strataCompact(engine, { trigger: 'manual', messages: MESSAGES }, builtIn, dashSession)
+    await prepareLedger(engine, dashSession)
+    await prepareLedger(engine, dashSession, { through: 2 })
+
+    expect(calls.length).toBe(6)
+    for (const c of calls) {
+      expect(c.argv).toContain(`--session=${dashSession}`)
+      expect(c.argv).not.toContain('--session')
+    }
   })
 })

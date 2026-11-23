@@ -32,7 +32,7 @@ function shellQuote(value: string): string {
 }
 
 const SELF = resolve(process.argv[1])
-const SHOW_COMMAND = (key: string) => `node ${shellQuote(SELF)} show ${shellQuote(key)}`
+const SHOW_COMMAND = (key: string) => `node ${shellQuote(SELF)} show ${key.startsWith('-') ? '-- ' : ''}${shellQuote(key)}`
 
 /** Offline stand-in for the ledger model: records how far it got, so lag is visible. */
 const noLedger: LedgerFn = async (previous, span) => ({ ledger: `${previous}\n- folded through #${span.at(-1)?.seq}`.trim(), requests: 1 })

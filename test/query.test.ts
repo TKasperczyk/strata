@@ -202,12 +202,54 @@ describe('archive query, search, and status', () => {
     expect(readReady(join(dir, 'sessions', SESSION))?.through).toBe(20)
 
     // 8. leading-dash instructions via `--instructions=...` parse cleanly
-    const dashPlan = execFileSync('node', [cliPath, 'ledger-plan', '--session', SESSION, '--in', '-', '--budget', '2000', '--sync', '--instructions=- keep auth notes'], {
+    const dashPlan = execFileSync('node', [cliPath, 'ledger-plan', `--session=${SESSION}`, '--in', '-', '--budget', '2000', '--sync', '--instructions=- keep auth notes'], {
       input: JSON.stringify({ messages: msgs }),
       env,
       encoding: 'utf-8'
     })
     expect(JSON.parse(dashPlan).focus).toBe('- keep auth notes')
+
+    // 9. leading-dash session keys work end-to-end across all CLI subcommands and cap maxTokens at 64k for 1M budgets
+    const dashSession = '-leading-dash-sess'
+    const dashPlanOut = execFileSync('node', [cliPath, 'ledger-plan', `--session=${dashSession}`, '--in', '-', '--budget', '2000', '--sync'], {
+      input: JSON.stringify({ messages: msgs }),
+      env,
+      encoding: 'utf-8'
+    })
+    const dashParsed = JSON.parse(dashPlanOut)
+    expect(dashParsed.needed).toBe(true)
+
+    const dashSaveOut = execFileSync('node', [cliPath, 'ledger-save', `--session=${dashSession}`, '--in', '-'], {
+      input: JSON.stringify({ ledger: '## Current state\n- dash saved (#0)', through: dashParsed.through, prefixHash: dashParsed.prefixHash, age: dashParsed.age }),
+      env,
+      encoding: 'utf-8'
+    })
+    expect(JSON.parse(dashSaveOut).saved).toBe(true)
+
+    const dashCompactOut = execFileSync('node', [cliPath, 'compact', `--session=${dashSession}`, '--in', '-', '--out', '-', '--budget', '2000', '--ledger', 'ready', '--native-tools'], {
+      input: JSON.stringify({ messages: msgs }),
+      env,
+      encoding: 'utf-8'
+    })
+    const dashCompacted = JSON.parse(dashCompactOut)
+    expect(dashCompacted.stats.ledgerThrough).toBe(dashParsed.through)
+    expect(dashCompacted.entries[0].built.text).toContain(`show -- ${dashSession}`)
+
+    const dashShowOut = execFileSync('node', [cliPath, 'show', '--', dashSession, '0'], { env, encoding: 'utf-8' })
+    expect(dashShowOut).toContain('task 0')
+    const dashSearchOut = execFileSync('node', [cliPath, 'search', '--', dashSession, '--weird-flag'], { env, encoding: 'utf-8' })
+    expect(dashSearchOut).toContain('#0')
+    const dashStatusOut = execFileSync('node', [cliPath, 'status', '--json', '--', dashSession], { env, encoding: 'utf-8' })
+    expect(JSON.parse(dashStatusOut).sessionKey).toBe(dashSession)
+
+    // 10. ledger-plan caps maxTokens at 64,000 even when --budget is 1,000,000
+    const hugeBudgetPlan = execFileSync('node', [cliPath, 'ledger-plan', `--session=${dashSession}`, '--through', '10', '--budget', '1000000', '--sync', '--instructions=refocus'], {
+      env,
+      encoding: 'utf-8'
+    })
+    const hugeParsed = JSON.parse(hugeBudgetPlan)
+    expect(hugeParsed.needed).toBe(true)
+    expect(hugeParsed.maxTokens).toBe(64_000)
   })
 
   it('shows media-only/empty rows cleanly, never splits emoji surrogate pairs on pagination, and marks pre-compaction ready ledgers pending', () => {

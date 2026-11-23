@@ -6543,8 +6543,10 @@ ${chunk}`,
     `Write the updated ledger. Stay under ${maxChars.toLocaleString("en-US")} characters.`
   ].filter(Boolean).join("\n\n");
 }
+var MAX_LEDGER_TOKENS = 64e3;
 function ledgerMaxTokens(maxChars) {
-  return Math.max(2e3, estimateTokens(maxChars) * 2);
+  if (!Number.isFinite(maxChars)) return maxChars === Infinity ? MAX_LEDGER_TOKENS : 2e3;
+  return Math.min(MAX_LEDGER_TOKENS, Math.max(2e3, estimateTokens(maxChars) * 2));
 }
 function sectionMeta(heading) {
   const lower = heading.toLowerCase();
@@ -7956,7 +7958,7 @@ function shellQuote(value) {
   return /^[A-Za-z0-9_./:@-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`;
 }
 var SELF = resolve(process.argv[1]);
-var SHOW_COMMAND = (key) => `node ${shellQuote(SELF)} show ${shellQuote(key)}`;
+var SHOW_COMMAND = (key) => `node ${shellQuote(SELF)} show ${key.startsWith("-") ? "-- " : ""}${shellQuote(key)}`;
 var noLedger = async (previous, span) => ({ ledger: `${previous}
 - folded through #${span.at(-1)?.seq}`.trim(), requests: 1 });
 function fail(message) {

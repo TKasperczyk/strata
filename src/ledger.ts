@@ -92,8 +92,15 @@ export function buildLedgerPrompt(previous: string, chunk: string, maxChars: num
     .join('\n\n')
 }
 
+/**
+ * Maximum output tokens permitted by Claude Code's `$.model.complete`
+ * (`ModelCompleteRequest.maxTokens`, capped at 64,000 for non-streaming calls).
+ */
+export const MAX_LEDGER_TOKENS = 64_000
+
 export function ledgerMaxTokens(maxChars: number): number {
-  return Math.max(2_000, estimateTokens(maxChars) * 2)
+  if (!Number.isFinite(maxChars)) return maxChars === Infinity ? MAX_LEDGER_TOKENS : 2_000
+  return Math.min(MAX_LEDGER_TOKENS, Math.max(2_000, estimateTokens(maxChars) * 2))
 }
 
 type Section = {

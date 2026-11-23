@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { loadConfig } from '../src/config.js'
-import { buildLedgerPrompt, ledgerRequests, renderSpan, resolveStandaloneModel, trimLedger } from '../src/ledger.js'
+import { loadConfig, shareChars } from '../src/config.js'
+import { buildLedgerPrompt, ledgerMaxTokens, ledgerRequests, MAX_LEDGER_TOKENS, renderSpan, resolveStandaloneModel, trimLedger } from '../src/ledger.js'
 import type { ArchivedMessage } from '../src/types.js'
 
 describe('ledger rendering and helpers', () => {
@@ -137,5 +137,25 @@ describe('ledger rendering and helpers', () => {
     expect(prompt).toContain('keep migration risks')
     expect(prompt).toContain('#1 user: hi')
     expect(prompt).toContain('5,000')
+  })
+
+  it('ledgerMaxTokens stays within [2_000, 64_000] across small, default, 1M-context, and non-finite inputs', () => {
+    expect(MAX_LEDGER_TOKENS).toBe(64_000)
+    // Lower bound and non-finite guards
+    expect(ledgerMaxTokens(0)).toBe(2_000)
+    expect(ledgerMaxTokens(-500)).toBe(2_000)
+    expect(ledgerMaxTokens(1_000)).toBe(2_000)
+    expect(ledgerMaxTokens(Number.NaN)).toBe(2_000)
+    expect(ledgerMaxTokens(Number.NEGATIVE_INFINITY)).toBe(2_000)
+    expect(ledgerMaxTokens(Number.POSITIVE_INFINITY)).toBe(64_000)
+
+    // Default 200k budget: 6% ledger share = 42,000 chars -> 12,000 * 2 = 24,000 tokens
+    expect(ledgerMaxTokens(shareChars(loadConfig({ budgetTokens: 200_000 }), 'ledger'))).toBe(24_000)
+
+    // Exact 64k boundary and above (STRATA_BUDGET_TOKENS >= 534_000, e.g. 1M-context sessions)
+    expect(ledgerMaxTokens(112_000)).toBe(64_000)
+    expect(ledgerMaxTokens(112_001)).toBe(64_000)
+    expect(ledgerMaxTokens(shareChars(loadConfig({ budgetTokens: 534_000 }), 'ledger'))).toBe(64_000)
+    expect(ledgerMaxTokens(shareChars(loadConfig({ budgetTokens: 1_000_000 }), 'ledger'))).toBe(64_000)
   })
 })

@@ -29,6 +29,8 @@ declare module 'claude-code' {
 const CLI_TIMEOUT_MS = 2 * 60 * 1000
 const TOOL_TIMEOUT_MS = 30 * 1000
 const LEDGER_CALL_TIMEOUT_MS = 2 * 60 * 1000
+/** Claude Code's `$.model.complete` refuses `maxTokens` above 64,000. */
+const MAX_MODEL_TOKENS = 64_000
 const DEFAULT_TRIGGER_TOKENS = 900_000
 /** Start preparing the ledger this far below the trigger (never below half of it), so it is ready in time. */
 const PREPARE_HEADROOM_TOKENS = 100_000
@@ -172,13 +174,18 @@ function trimIntermediateLedger(ledger: string, maxChars: number): string {
 
 /** Run every chunk of a ledger plan through Claude Code's `$.model.complete`. */
 async function executeLedgerPlan($: EngineInterface, plan: LedgerPlanNeeded): Promise<PreparedLedger> {
+  // Defense in depth: `$.model.complete` refuses maxTokens outside [1, 64_000].
+  const maxTokens =
+    typeof plan.maxTokens === 'number' && Number.isFinite(plan.maxTokens)
+      ? Math.min(MAX_MODEL_TOKENS, Math.max(1, Math.floor(plan.maxTokens)))
+      : 2_000
   let ledger = plan.previous
   for (const chunk of plan.chunks) {
     const reply = await $.model.complete({
       model: plan.model,
       system: plan.system,
       prompt: buildLedgerPrompt(ledger, chunk, plan.maxChars, plan.focus),
-      maxTokens: plan.maxTokens,
+      maxTokens,
       timeoutMs: LEDGER_CALL_TIMEOUT_MS
     })
     if (!reply.isAnswered) throw new Error(`ledger model failed: ${describeModelFailure(reply)}`)
@@ -227,12 +234,12 @@ export type PrepareTarget = { through: number }
 export async function prepareLedger($: EngineInterface, session: string, target?: PrepareTarget): Promise<void> {
   let planRun
   if (target?.through !== undefined) {
-    planRun = await $.process.run([...cli($), 'ledger-plan', '--session', session, '--through', String(target.through)], {
+    planRun = await $.process.run([...cli($), 'ledger-plan', `--session=${session}`, '--through', String(target.through)], {
       timeoutMs: CLI_TIMEOUT_MS
     })
   } else {
     const [rawMessages, hidden] = await Promise.all([$.session.messages(), hiddenContext($)])
-    planRun = await $.process.run([...cli($), 'ledger-plan', '--session', session, '--in', '-'], {
+    planRun = await $.process.run([...cli($), 'ledger-plan', `--session=${session}`, '--in', '-'], {
       stdin: JSON.stringify({ messages: rawMessages.map(plain), ...hidden }),
       timeoutMs: CLI_TIMEOUT_MS
     })
@@ -247,7 +254,7 @@ export async function prepareLedger($: EngineInterface, session: string, target?
     return
   }
   const prepared = await executeLedgerPlan($, plan)
-  const saveRun = await $.process.run([...cli($), 'ledger-save', '--session', session, '--in', '-'], {
+  const saveRun = await $.process.run([...cli($), 'ledger-save', `--session=${session}`, '--in', '-'], {
     stdin: JSON.stringify(prepared),
     timeoutMs: CLI_TIMEOUT_MS
   })
@@ -302,7 +309,7 @@ export async function strataCompact(
   // strata-trigger compacts with the ready ledger so the user never waits.
   // /compact (and auto, or any compaction with explicit instructions) brings the ledger up to date via $.model.complete first.
   if (e.trigger !== 'plugin' || e.instructions) {
-    const planArgv = [...cli($), 'ledger-plan', '--session', session, '--in', '-', '--sync']
+    const planArgv = [...cli($), 'ledger-plan', `--session=${session}`, '--in', '-', '--sync']
     if (e.instructions) planArgv.push(`--instructions=${e.instructions}`)
     const planRun = await $.process.run(planArgv, {
       stdin: JSON.stringify({ messages: snapshot, ...hidden, ...(e.instructions ? { instructions: e.instructions } : {}) }),
@@ -324,7 +331,7 @@ export async function strataCompact(
     }
   }
 
-  const argv = [...cli($), 'compact', '--session', session, '--in', '-', '--out', '-', '--ledger', 'ready', '--native-tools']
+  const argv = [...cli($), 'compact', `--session=${session}`, '--in', '-', '--out', '-', '--ledger', 'ready', '--native-tools']
   if (e.instructions) argv.push(`--instructions=${e.instructions}`)
   const run = await $.process.run(argv, {
     stdin: JSON.stringify({
