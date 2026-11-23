@@ -25,7 +25,9 @@ var INITIAL_STATE = {
   compactions: 0
 };
 function sessionDir(dataDir, sessionKey) {
-  if (!/^[A-Za-z0-9._:-]+$/.test(sessionKey)) throw new Error(`invalid session key: ${sessionKey}`);
+  if (sessionKey === "." || sessionKey === ".." || !/^[A-Za-z0-9._:-]+$/.test(sessionKey)) {
+    throw new Error(`invalid session key: ${sessionKey}`);
+  }
   return join(dataDir, "sessions", sessionKey);
 }
 function archivePath(dir) {
@@ -7429,7 +7431,8 @@ function planCompaction(input, config, reserveFullLedger) {
   const preferredLedgerChars = fullReserve ? ledgerCap : Math.min(knownLedger.ledger.length, ledgerCap);
   const makeHeaderSizer = (ledgerChars) => {
     const cache = /* @__PURE__ */ new Map();
-    const placeholder = ledgerChars > 0 ? "x".repeat(ledgerChars) : "";
+    const placeholder = ledgerChars > 0 ? "x" : "";
+    const ledgerExtra = ledgerChars > 0 ? ledgerChars - 1 : 0;
     const indexCap = shareChars(config, "index");
     return (cut2) => {
       if (cut2 <= 0) return 0;
@@ -7437,7 +7440,7 @@ function planCompaction(input, config, reserveFullLedger) {
       if (hit !== void 0) return hit;
       const evicted = rows.slice(0, units[cut2].start);
       if (!fullReserve) {
-        const size2 = buildHeader(input, dir, evicted, placeholder, knownLedger.ledgerThrough, config).length;
+        const size2 = buildHeader(input, dir, evicted, placeholder, knownLedger.ledgerThrough, config).length + ledgerExtra;
         cache.set(cut2, size2);
         return size2;
       }
@@ -7446,9 +7449,9 @@ function planCompaction(input, config, reserveFullLedger) {
       const baseProtect = base.ledgerThrough < evicted.length ? evicted[base.ledgerThrough]?.seq : void 0;
       const baseIdxLen = renderIndex(episodes, indexCap, { protectAfterSeq: baseProtect }).length;
       const indexSlack = fullIdxLen > indexCap ? Math.max(0, indexCap - baseIdxLen) : 0;
-      let size = buildHeader(input, dir, evicted, placeholder, base.ledgerThrough, config).length + indexSlack;
+      let size = buildHeader(input, dir, evicted, placeholder, base.ledgerThrough, config).length + ledgerExtra + indexSlack;
       if (placeholder && base.ledgerThrough < evicted.length && evicted.length > 1) {
-        const maxLagHeader = buildHeader(input, dir, evicted, placeholder, evicted.length - 1, config).length;
+        const maxLagHeader = buildHeader(input, dir, evicted, placeholder, evicted.length - 1, config).length + ledgerExtra;
         const lagProtect = evicted[evicted.length - 1]?.seq;
         const lagIdxLen = renderIndex(episodes, indexCap, { protectAfterSeq: lagProtect }).length;
         const lagSlack = fullIdxLen > indexCap ? Math.max(0, indexCap - lagIdxLen) : 0;
@@ -8331,10 +8334,10 @@ var commands = {
   status: runStatus,
   replay: runReplay
 };
-var run = command ? commands[command] : void 0;
+var run = command && Object.hasOwn(commands, command) ? commands[command] : void 0;
 if (!run) fail(command ? `unknown command: ${command}` : "no command given");
 var EXIT_DECLINED = 3;
-Promise.resolve(run(rest)).catch((error) => {
+Promise.resolve().then(() => run(rest)).catch((error) => {
   process.stderr.write(`[strata] ${error instanceof Error ? error.stack : String(error)}
 `);
   process.exit(error instanceof DeclineError ? EXIT_DECLINED : 1);

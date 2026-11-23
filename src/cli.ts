@@ -436,12 +436,14 @@ const commands: Record<string, (argv: string[]) => unknown> = {
   status: runStatus,
   replay: runReplay
 }
-const run = command ? commands[command] : undefined
+const run = command && Object.hasOwn(commands, command) ? commands[command] : undefined
 if (!run) fail(command ? `unknown command: ${command}` : 'no command given')
 // Exit 3 means strata declined (too big, or thinking it cannot keep): the plugin
 // falls back to the built-in compactor either way.
 const EXIT_DECLINED = 3
-Promise.resolve(run(rest)).catch(error => {
-  process.stderr.write(`[strata] ${error instanceof Error ? error.stack : String(error)}\n`)
-  process.exit(error instanceof DeclineError ? EXIT_DECLINED : 1)
-})
+Promise.resolve()
+  .then(() => run(rest))
+  .catch(error => {
+    process.stderr.write(`[strata] ${error instanceof Error ? error.stack : String(error)}\n`)
+    process.exit(error instanceof DeclineError ? EXIT_DECLINED : 1)
+  })

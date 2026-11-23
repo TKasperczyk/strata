@@ -558,7 +558,10 @@ function planCompaction(input: CompactInput, config: Config, reserveFullLedger?:
 
   const makeHeaderSizer = (ledgerChars: number) => {
     const cache = new Map<number, number>()
-    const placeholder = ledgerChars > 0 ? 'x'.repeat(ledgerChars) : ''
+    // Measure with a 1-char probe plus `(ledgerChars - 1)` to avoid allocating
+    // huge placeholder strings (or hitting RangeError on extreme budgets).
+    const placeholder = ledgerChars > 0 ? 'x' : ''
+    const ledgerExtra = ledgerChars > 0 ? ledgerChars - 1 : 0
     const indexCap = shareChars(config, 'index')
     return (cut: number): number => {
       if (cut <= 0) return 0
@@ -566,7 +569,7 @@ function planCompaction(input: CompactInput, config: Config, reserveFullLedger?:
       if (hit !== undefined) return hit
       const evicted = rows.slice(0, units[cut].start)
       if (!fullReserve) {
-        const size = buildHeader(input, dir, evicted, placeholder, knownLedger.ledgerThrough, config).length
+        const size = buildHeader(input, dir, evicted, placeholder, knownLedger.ledgerThrough, config).length + ledgerExtra
         cache.set(cut, size)
         return size
       }
@@ -578,10 +581,10 @@ function planCompaction(input: CompactInput, config: Config, reserveFullLedger?:
       const baseProtect = base.ledgerThrough < evicted.length ? evicted[base.ledgerThrough]?.seq : undefined
       const baseIdxLen = renderIndex(episodes, indexCap, { protectAfterSeq: baseProtect }).length
       const indexSlack = fullIdxLen > indexCap ? Math.max(0, indexCap - baseIdxLen) : 0
-      let size = buildHeader(input, dir, evicted, placeholder, base.ledgerThrough, config).length + indexSlack
+      let size = buildHeader(input, dir, evicted, placeholder, base.ledgerThrough, config).length + ledgerExtra + indexSlack
       if (placeholder && base.ledgerThrough < evicted.length && evicted.length > 1) {
         // Also bound the lag notice with the widest seq numbers in `evicted`.
-        const maxLagHeader = buildHeader(input, dir, evicted, placeholder, evicted.length - 1, config).length
+        const maxLagHeader = buildHeader(input, dir, evicted, placeholder, evicted.length - 1, config).length + ledgerExtra
         const lagProtect = evicted[evicted.length - 1]?.seq
         const lagIdxLen = renderIndex(episodes, indexCap, { protectAfterSeq: lagProtect }).length
         const lagSlack = fullIdxLen > indexCap ? Math.max(0, indexCap - lagIdxLen) : 0

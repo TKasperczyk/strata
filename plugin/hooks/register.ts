@@ -140,8 +140,16 @@ function cli($: EngineInterface): string[] {
   return ['node', `${$.plugin.root}/bin/strata.mjs`]
 }
 
+function safeSlicePrefix(text: string, max: number): string {
+  if (max <= 0) return ''
+  if (text.length <= max) return text
+  const code = text.charCodeAt(max - 1)
+  return code >= 0xd800 && code <= 0xdbff ? text.slice(0, max - 1) : text.slice(0, max)
+}
+
 /** Compact section-aware trim for intermediate multi-chunk ledger outputs, preserving Current state and Open items. */
 function trimIntermediateLedger(ledger: string, maxChars: number): string {
+  if (maxChars <= 0) return ''
   if (ledger.length <= maxChars) return ledger
   const priorityOf = (h: string) => {
     const l = h.toLowerCase()
@@ -158,36 +166,74 @@ function trimIntermediateLedger(ledger: string, maxChars: number): string {
     if (line.startsWith('## ')) sections.push({ heading: line, priority: priorityOf(line), lines: [] })
     else if (sections.length > 0 && line.trim()) sections[sections.length - 1]!.lines.push(line)
   }
-  if (!sections.length) return ledger.slice(0, maxChars)
+  if (!sections.length) return safeSlicePrefix(ledger, maxChars)
   const render = () => sections.map(s => (s.lines.length ? `${s.heading}\n${s.lines.join('\n')}` : s.heading)).join('\n\n')
   let out = render()
   while (out.length > maxChars && sections.length > 0) {
     const ordered = [...sections].sort((a, b) => a.priority - b.priority)
-    const target = ordered.find(s => s.lines.length > 0)
-    if (target && target.lines.length > 1) target.lines.shift()
-    else if (sections.length > 1) sections.splice(sections.indexOf(ordered[0]!), 1)
+    const empty = ordered.find(s => s.lines.length === 0)
+    if (empty) {
+      sections.splice(sections.indexOf(empty), 1)
+      out = render()
+      continue
+    }
+    const target = ordered[0]!
+    if (target.lines.length > 1) target.lines.shift()
+    else if (sections.length > 1) sections.splice(sections.indexOf(target), 1)
     else break
     out = render()
   }
-  return out.length <= maxChars ? out : out.slice(0, maxChars)
+  return out.length <= maxChars ? out : safeSlicePrefix(out, maxChars)
+}
+
+/**
+ * Extract a lower positive token limit from a `$.model.complete` refusal when
+ * a model's own output cap is below `MAX_MODEL_TOKENS` (e.g. 4,096 / 8,192 / 32,000).
+ * Ignores model-id version/date tokens and HTTP status codes (< 1,024).
+ */
+function parseLowerTokenLimit(message: string, currentMax: number): number | undefined {
+  if (!/max[_\s-]?tokens/i.test(message)) return undefined
+  let best: number | undefined
+  for (const match of message.matchAll(/(?<![A-Za-z0-9_-])(?<!\d\.)(\d+(?:,\d{3})*)(?![A-Za-z0-9_-])(?!\.\d)/g)) {
+    const n = Number.parseInt(match[1]!.replace(/,/g, ''), 10)
+    if (n >= 1_024 && n < currentMax && (best === undefined || n > best)) best = n
+  }
+  return best
 }
 
 /** Run every chunk of a ledger plan through Claude Code's `$.model.complete`. */
 async function executeLedgerPlan($: EngineInterface, plan: LedgerPlanNeeded): Promise<PreparedLedger> {
   // Defense in depth: `$.model.complete` refuses maxTokens outside [1, 64_000].
-  const maxTokens =
+  let maxTokens =
     typeof plan.maxTokens === 'number' && Number.isFinite(plan.maxTokens)
       ? Math.min(MAX_MODEL_TOKENS, Math.max(1, Math.floor(plan.maxTokens)))
-      : 2_000
+      : plan.maxTokens === Infinity
+        ? MAX_MODEL_TOKENS
+        : 2_000
   let ledger = plan.previous
   for (const chunk of plan.chunks) {
-    const reply = await $.model.complete({
-      model: plan.model,
-      system: plan.system,
-      prompt: buildLedgerPrompt(ledger, chunk, plan.maxChars, plan.focus),
-      maxTokens,
-      timeoutMs: LEDGER_CALL_TIMEOUT_MS
-    })
+    const prompt = buildLedgerPrompt(ledger, chunk, plan.maxChars, plan.focus)
+    let reply: ModelCompleteResult
+    try {
+      reply = await $.model.complete({
+        model: plan.model,
+        system: plan.system,
+        prompt,
+        maxTokens,
+        timeoutMs: LEDGER_CALL_TIMEOUT_MS
+      })
+    } catch (error) {
+      const lowerLimit = parseLowerTokenLimit(describe(error), maxTokens)
+      if (lowerLimit === undefined) throw error
+      maxTokens = lowerLimit
+      reply = await $.model.complete({
+        model: plan.model,
+        system: plan.system,
+        prompt,
+        maxTokens,
+        timeoutMs: LEDGER_CALL_TIMEOUT_MS
+      })
+    }
     if (!reply.isAnswered) throw new Error(`ledger model failed: ${describeModelFailure(reply)}`)
     const text = reply.text.trim()
     if (!text) throw new Error('ledger model returned empty text')
@@ -343,6 +389,10 @@ export async function strataCompact(
     }),
     timeoutMs: CLI_TIMEOUT_MS
   })
+  if (run.exitCode === EXIT_DECLINED) {
+    $.ui.log(`compaction declined, using the built-in compactor. ${run.stderr.slice(-500)}`)
+    return next(e)
+  }
   if (run.exitCode !== 0 || run.isStdoutTruncated) {
     $.ui.log(`compaction failed (exit ${run.exitCode}), using the built-in compactor. ${run.stderr.slice(-500)}`)
     return next(e)
@@ -463,7 +513,7 @@ export const register: Register = on => {
     const session = await $.session.id()
     const argv = [...cli($), 'show']
     const offset = typeof e.offset === 'number' && Number.isFinite(e.offset) && e.offset >= 0 ? Math.floor(e.offset) : 0
-    const limit = typeof e.limit === 'number' && Number.isFinite(e.limit) && e.limit > 0 ? Math.min(100_000, Math.floor(e.limit)) : 20_000
+    const limit = typeof e.limit === 'number' && Number.isFinite(e.limit) && e.limit >= 1 ? Math.min(100_000, Math.floor(e.limit)) : 20_000
     argv.push('--offset', String(offset), '--limit', String(limit), '--', session, String(seq))
     if (lastSeq !== undefined) argv.push(String(lastSeq))
     const run = await $.process.run(argv, { timeoutMs: TOOL_TIMEOUT_MS })
@@ -485,7 +535,7 @@ export const register: Register = on => {
     if (e.role === 'user' || e.role === 'assistant') argv.push('--role', e.role)
     if (typeof e.from_seq === 'number' && Number.isFinite(e.from_seq) && e.from_seq >= 0) argv.push('--from', String(Math.floor(e.from_seq)))
     if (typeof e.to_seq === 'number' && Number.isFinite(e.to_seq) && e.to_seq >= 0) argv.push('--to', String(Math.floor(e.to_seq)))
-    if (typeof e.max_matches === 'number' && Number.isFinite(e.max_matches) && e.max_matches > 0) argv.push('--max', String(Math.min(100, Math.floor(e.max_matches))))
+    if (typeof e.max_matches === 'number' && Number.isFinite(e.max_matches) && e.max_matches >= 1) argv.push('--max', String(Math.min(100, Math.floor(e.max_matches))))
     argv.push('--', session, query)
     const run = await $.process.run(argv, { timeoutMs: TOOL_TIMEOUT_MS })
     if (run.exitCode !== 0) {

@@ -13,7 +13,9 @@ export const INITIAL_STATE: SessionState = {
 }
 
 export function sessionDir(dataDir: string, sessionKey: string): string {
-  if (!/^[A-Za-z0-9._:-]+$/.test(sessionKey)) throw new Error(`invalid session key: ${sessionKey}`)
+  if (sessionKey === '.' || sessionKey === '..' || !/^[A-Za-z0-9._:-]+$/.test(sessionKey)) {
+    throw new Error(`invalid session key: ${sessionKey}`)
+  }
   return join(dataDir, 'sessions', sessionKey)
 }
 

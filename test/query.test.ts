@@ -1,5 +1,5 @@
-import { execFileSync } from 'child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'fs'
+import { execFileSync, spawnSync } from 'child_process'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join, resolve } from 'path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -7,7 +7,7 @@ import { compact } from '../src/compact.js'
 import { loadConfig, type Config } from '../src/config.js'
 import { formatSessionStatus, searchArchive, sessionStatus, showArchive } from '../src/query.js'
 import { writeReady, prefixHash, readReady } from '../src/ready.js'
-import { appendArchive, readArchive } from '../src/archive.js'
+import { appendArchive, readArchive, sessionDir } from '../src/archive.js'
 import type { Message } from '../src/types.js'
 
 const SESSION = 'query-sess'
@@ -318,5 +318,53 @@ describe('archive query, search, and status', () => {
     expect(out).toContain('prepare at')
     expect(out).toContain('#1 archived')
     expect(out).toContain('end: live')
+  })
+
+  it('rejects . and .. session keys, exits 3 when ledger-plan declines, rejects prototype command names, and handles huge budgets without RangeError', () => {
+    // 1. sessionDir rejects "." and ".." traversal while allowing leading dashes and internal dots
+    expect(() => sessionDir(dir, '.')).toThrow(/invalid session key/)
+    expect(() => sessionDir(dir, '..')).toThrow(/invalid session key/)
+    expect(sessionDir(dir, '-leading-dash')).toBe(join(dir, 'sessions', '-leading-dash'))
+    expect(sessionDir(dir, 'a..b')).toBe(join(dir, 'sessions', 'a..b'))
+
+    const cliPath = resolve('dist/cli.js')
+    const env = { ...process.env, STRATA_DATA_DIR: dir }
+    const smallMsgs = [user('hi'), assistant('ok')]
+
+    for (const badKey of ['.', '..']) {
+      const r = spawnSync('node', [cliPath, 'compact', `--session=${badKey}`, '--in', '-', '--out', '-', '--budget', '2000', '--ledger', 'ready'], {
+        input: JSON.stringify({ messages: smallMsgs }),
+        env,
+        encoding: 'utf-8'
+      })
+      expect(r.status).toBe(1)
+      expect(r.stderr).toContain('invalid session key')
+    }
+    expect(existsSync(join(dir, 'state.json'))).toBe(false)
+    expect(existsSync(join(dir, 'sessions', 'state.json'))).toBe(false)
+
+    // 2. Synchronous ledger-plan DeclineError exits with EXIT_DECLINED (3), not 1
+    const oversizeMsgs = [user('hi'), assistant('X'.repeat(5_000))]
+    const declined = spawnSync('node', [cliPath, 'ledger-plan', '--session=decline-sess', '--in', '-', '--budget', '100', '--sync'], {
+      input: JSON.stringify({ messages: oversizeMsgs }),
+      env,
+      encoding: 'utf-8'
+    })
+    expect(declined.status).toBe(3)
+    expect(declined.stderr).toContain('[strata]')
+
+    // 3. Prototype property names like `toString` are rejected as unknown commands
+    const protoCmd = spawnSync('node', [cliPath, 'toString'], { env, encoding: 'utf-8' })
+    expect(protoCmd.status).toBe(2)
+    expect(protoCmd.stderr).toContain('unknown command: toString')
+
+    // 4. Extreme --budget values do not throw RangeError in makeHeaderSizer
+    const hugeBudget = spawnSync('node', [cliPath, 'ledger-plan', '--session=huge-budget', '--in', '-', '--budget', '99999999999999', '--sync'], {
+      input: JSON.stringify({ messages: smallMsgs }),
+      env,
+      encoding: 'utf-8'
+    })
+    expect(hugeBudget.status).toBe(0)
+    expect(JSON.parse(hugeBudget.stdout).needed).toBe(false)
   })
 })

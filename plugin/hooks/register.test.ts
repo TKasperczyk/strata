@@ -362,6 +362,14 @@ describe('strataCompact', () => {
     const badQuery = await $.tool.call({ tool: 'mcp__strata__search', query: '' })
     expect(badQuery.isError).toBe(true)
     expect(runs.length).toBe(runsBeforeErr)
+
+    // Fractional (0, 1) limit / max_matches must not floor to 0 and fail CLI validation
+    await $.tool.call({ tool: 'mcp__strata__show', seq: 5, limit: 0.5 })
+    const fracShowArgv = runs.at(-1)?.argv ?? []
+    expect(fracShowArgv[fracShowArgv.indexOf('--limit') + 1]).toBe('20000')
+    await $.tool.call({ tool: 'mcp__strata__search', query: 'ok', max_matches: 0.5 })
+    const fracSearchArgv = runs.at(-1)?.argv ?? []
+    expect(fracSearchArgv).not.toContain('--max')
   })
 
   test('session.end (/clear) cancels queued background prep and resets pending state', async ($, on) => {
@@ -462,5 +470,74 @@ describe('strataCompact', () => {
       expect(c.argv).toContain(`--session=${dashSession}`)
       expect(c.argv).not.toContain('--session')
     }
+  })
+
+  test('retries once with the lower model output limit when $.model.complete refuses maxTokens, and does not retry unrelated errors', async () => {
+    const stdout = JSON.stringify({ entries: [{ keep: 2 }], stats: { rawChars: 7000, outputChars: 3500, matched: 0, previousOutput: 0, cut: 2, ledgerThrough: 2 } })
+    const models: ModelCompleteRequest[] = []
+    let attempt = 0
+    const engine = fakeEngine(cli(stdout), [], [], models, {
+      onRun: argv =>
+        argv.includes('ledger-plan')
+          ? cli(JSON.stringify({ ...SAMPLE_PLAN, model: 'claude-3-5-haiku-20241022', maxTokens: 64_000, chunks: ['c1', 'c2'] }))
+          : cli(stdout),
+      onModel: req => {
+        attempt++
+        if (attempt === 1) throw new Error(`maxTokens ${req.maxTokens} exceeds claude-3-5-haiku-20241022 output limit of 8,192.`)
+        return { isAnswered: true as const, text: '## Current state\n- recovered (#0)', usage: ZERO_USAGE }
+      }
+    })
+    await strataCompact(engine, { trigger: 'manual', messages: MESSAGES }, builtIn, SESSION)
+    // Chunk 1 tried 64,000 -> rejected -> retried with 8,192; chunk 2 reused 8,192 directly!
+    expect(models.map(m => m.maxTokens)).toEqual([64_000, 8_192, 8_192])
+
+    // Unrelated rejections (blocked model or HTTP 400 without valid cap) must NOT retry.
+    const noRetryModels: ModelCompleteRequest[] = []
+    const logs: string[] = []
+    const blockedEngine = fakeEngine(cli(stdout), [], logs, noRetryModels, {
+      onRun: argv => (argv.includes('ledger-plan') ? cli(JSON.stringify({ ...SAMPLE_PLAN, maxTokens: 24_000 })) : cli(stdout)),
+      onModel: () => {
+        throw new Error('maxTokens invalid (HTTP 400)')
+      }
+    })
+    await strataCompact(blockedEngine, { trigger: 'manual', messages: MESSAGES }, builtIn, SESSION)
+    expect(noRetryModels).toHaveLength(1)
+    expect(logs.some(l => l.includes('HTTP 400'))).toBe(true)
+  })
+
+  test('trimIntermediateLedger drops empty low-priority sections before trimming Current state and avoids splitting surrogate pairs', async () => {
+    const models: ModelCompleteRequest[] = []
+    const stdout = JSON.stringify({ entries: [{ keep: 2 }], stats: { rawChars: 7000, outputChars: 3500, matched: 0, previousOutput: 0, cut: 2, ledgerThrough: 2 } })
+    const chunk1WithEmptyDeadEnds = [
+      '## Dead ends',
+      '',
+      '## Current state',
+      '- FIRST_CRITICAL_BULLET (#1)',
+      `- SECOND_BULLET ${'🚀'.repeat(20)} (#2)`
+    ].join('\n')
+    let callIdx = 0
+    const engine = fakeEngine(cli(stdout), [], [], models, {
+      onRun: argv =>
+        argv.includes('ledger-plan')
+          // maxChars * 2 = 120: fits Current state intact (~113 chars) once empty Dead ends (14 chars) is dropped!
+          ? cli(JSON.stringify({ ...SAMPLE_PLAN, maxChars: 60, chunks: ['c1', 'c2'] }))
+          : cli(stdout),
+      onModel: () => {
+        callIdx++
+        return { isAnswered: true as const, text: callIdx === 1 ? chunk1WithEmptyDeadEnds : '## Current state\n- done (#2)', usage: ZERO_USAGE }
+      }
+    })
+    await strataCompact(engine, { trigger: 'manual', messages: MESSAGES }, builtIn, SESSION)
+    expect(models).toHaveLength(2)
+    expect(models[1]?.prompt).toContain('FIRST_CRITICAL_BULLET')
+    expect(models[1]?.prompt).not.toContain('## Dead ends')
+    expect(models[1]?.prompt).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/)
+  })
+
+  test('logs compaction declined when compact itself exits with EXIT_DECLINED (3)', async () => {
+    const logs: string[] = []
+    const result = await strataCompact(fakeEngine(cli('', 3, 'oversize'), [], logs, []), { trigger: 'plugin', messages: MESSAGES }, builtIn, SESSION)
+    expect(result.messages?.[0]?.text).toBe('built-in summary')
+    expect(logs.some(l => l.includes('compaction declined'))).toBe(true)
   })
 })
