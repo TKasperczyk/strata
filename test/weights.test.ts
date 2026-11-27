@@ -349,10 +349,15 @@ describe('compaction with the API form', () => {
   afterEach(() => rmSync(dir, { recursive: true, force: true }))
 
   it('counts the images and thinking of rows it keeps whole against the budget', async () => {
-    const { rows, api } = turns(8)
-    const textOnly = await run(rows)
+    // Pasted prompt images stay on kept prompt rows, so seeing the API form adds real hidden weight.
+    const pastedRows = Array.from({ length: 8 }, (_, n) => [user(`look at pasted shot ${n}`), answer(`shot ${n} looks fine ${'.'.repeat(300)}`)]).flat()
+    const pastedApi: ApiMessage[] = Array.from({ length: 8 }, (_, n) => [
+      { role: 'user' as const, content: [{ type: 'text', text: `look at pasted shot ${n}` }, image(png(1200, 1200))] },
+      { role: 'assistant' as const, content: [{ type: 'text', text: `shot ${n} looks fine ${'.'.repeat(300)}` }] }
+    ]).flat()
+    const textOnly = await run(pastedRows)
     rmSync(dir, { recursive: true, force: true })
-    const weighted = await run(rows, api)
+    const weighted = await run(pastedRows, pastedApi)
     expect(weighted.stats.hiddenChars).toBeGreaterThan(0)
     expect(weighted.stats.outputChars).toBeLessThanOrEqual(BUDGET_CHARS)
     // Seeing the weight, it keeps fewer rows verbatim than the text-only count did.
@@ -372,9 +377,12 @@ describe('compaction with the API form', () => {
   })
 
   it('writes no image files when it declines', async () => {
-    // Budget smaller than one 1,600-token image + 1,000-token thinking response (~2,600 tokens).
-    config = loadConfig({ dataDir: dir, budgetTokens: 1_500, ledgerRebuildEvery: 0 })
-    const { rows, api } = shotTurn(0, 2_000)
+    // Budget smaller than a single kept prompt carrying a 1,600-token pasted image.
+    config = loadConfig({ dataDir: dir, budgetTokens: 1_200, ledgerRebuildEvery: 0 })
+    const rows = [user('inspect this large screenshot')]
+    const api: ApiMessage[] = [
+      { role: 'user', content: [{ type: 'text', text: 'inspect this large screenshot' }, image(png(2_000, 2_000))] }
+    ]
     await expect(run(rows, api)).rejects.toBeInstanceOf(OversizeError)
     expect(existsSync(join(dir, 'sessions', SESSION, 'media'))).toBe(false)
   })

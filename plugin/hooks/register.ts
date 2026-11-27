@@ -50,6 +50,7 @@ type CliResult = {
     outputChars: number
     rawChars: number
     matched: number
+    recoveredTail?: boolean
     previousOutput: number
     cut: number
     ledgerThrough: number
@@ -269,7 +270,15 @@ async function hiddenContext($: EngineInterface): Promise<{ api?: unknown; usage
   }
 }
 
-export type PrepareTarget = { through: number }
+export type PrepareTarget = { through: number; overhead?: number }
+
+function firstErrorLine(stderr: string): string {
+  const line = stderr
+    .split('\n')
+    .map(l => l.trim())
+    .find(Boolean)
+  return (line ?? 'unknown error').slice(0, 300)
+}
 
 /**
  * Fold evicted history into a ready ledger, off the user's path, using
@@ -277,65 +286,114 @@ export type PrepareTarget = { through: number }
  * hidden weights (`api` and `usage`); post-compaction catch-up passes an
  * explicit `--through <cut>` against the already-committed archive and branch.
  */
-export async function prepareLedger($: EngineInterface, session: string, target?: PrepareTarget): Promise<void> {
+export async function prepareLedger($: EngineInterface, session: string, target?: PrepareTarget, expectedGen = sessionGen): Promise<void> {
+  const isCurrent = () => expectedGen === sessionGen
   let planRun
+  let overheadTokens = target?.overhead
   if (target?.through !== undefined) {
-    planRun = await $.process.run([...cli($), 'ledger-plan', `--session=${session}`, '--through', String(target.through)], {
-      timeoutMs: CLI_TIMEOUT_MS
-    })
+    const argv = [...cli($), 'ledger-plan', `--session=${session}`, '--through', String(target.through)]
+    if (overheadTokens !== undefined && overheadTokens > 0) argv.push('--overhead', String(Math.round(overheadTokens)))
+    planRun = await $.process.run(argv, { timeoutMs: CLI_TIMEOUT_MS })
   } else {
     const [rawMessages, hidden] = await Promise.all([$.session.messages(), hiddenContext($)])
+    overheadTokens = hidden.usage?.overhead
     planRun = await $.process.run([...cli($), 'ledger-plan', `--session=${session}`, '--in', '-'], {
       stdin: JSON.stringify({ messages: rawMessages.map(plain), ...hidden }),
       timeoutMs: CLI_TIMEOUT_MS
     })
   }
+  if (!isCurrent()) return
+  if (planRun.exitCode === EXIT_DECLINED) {
+    const detail = firstErrorLine(planRun.stderr)
+    lastPrepStatus = `skipped: declined (${detail})`
+    $.ui.log(`ledger prep skipped: declined (${detail})`, { to: 'debug' })
+    return
+  }
   if (planRun.exitCode !== 0 || planRun.isStdoutTruncated) {
-    $.ui.log(`ledger prep plan failed (exit ${planRun.exitCode}): ${planRun.stderr.slice(-300)}`, { to: 'debug' })
+    const err = `plan failed (exit ${planRun.exitCode}): ${firstErrorLine(planRun.stderr)}`
+    reportPrepFailure($, err, expectedGen)
     return
   }
   const plan = JSON.parse(planRun.stdout) as LedgerPlan
   if (!plan.needed) {
+    lastPrepStatus = `skipped: ${plan.reason}`
     $.ui.log(`ledger prep skipped: ${plan.reason}`, { to: 'debug' })
     return
   }
   const prepared = await executeLedgerPlan($, plan)
-  const saveRun = await $.process.run([...cli($), 'ledger-save', `--session=${session}`, '--in', '-'], {
+  if (!isCurrent()) return
+  const saveArgv = [...cli($), 'ledger-save', `--session=${session}`, '--in', '-']
+  if (overheadTokens !== undefined && overheadTokens > 0) saveArgv.push('--overhead', String(Math.round(overheadTokens)))
+  const saveRun = await $.process.run(saveArgv, {
     stdin: JSON.stringify(prepared),
     timeoutMs: CLI_TIMEOUT_MS
   })
-  $.ui.log(`ledger prep ${saveRun.exitCode === 0 ? saveRun.stdout.trim() : `save failed (exit ${saveRun.exitCode}): ${saveRun.stderr.slice(-300)}`}`, { to: 'debug' })
+  if (!isCurrent()) return
+  if (saveRun.exitCode !== 0) {
+    reportPrepFailure($, `save failed (exit ${saveRun.exitCode}): ${firstErrorLine(saveRun.stderr)}`, expectedGen)
+    return
+  }
+  let savedResult: { saved?: boolean; through?: number; reason?: string } | undefined
+  try {
+    savedResult = JSON.parse(saveRun.stdout) as { saved?: boolean; through?: number; reason?: string }
+  } catch {
+    // Non-JSON stdout is treated as saved.
+  }
+  lastLoggedPrepError = undefined
+  if (savedResult?.saved === false) {
+    lastPrepStatus = `skipped: ${savedResult.reason ?? 'not saved'}`
+  } else {
+    lastPrepStatus = `saved through ${savedResult?.through ?? prepared.through}`
+  }
+  $.ui.log(`ledger prep ${saveRun.stdout.trim()}`, { to: 'debug' })
 }
 
 // One background ledger job in flight per session; reset cleanly on session.start and session.end (/clear, /resume).
 let preparing = false
 let sessionGen = 0
-let pendingCatchUp: { session: string; through: number } | undefined
+let pendingCatchUp: { session: string; through: number; overhead?: number } | undefined
+let lastPrepStatus: string | undefined
+let lastLoggedPrepError: string | undefined
+
+function reportPrepFailure($: EngineInterface, detail: string, expectedGen: number): void {
+  if (expectedGen !== sessionGen) return
+  lastPrepStatus = `failed: ${detail}`
+  if (detail !== lastLoggedPrepError) {
+    lastLoggedPrepError = detail
+    $.ui.log(`background ledger prep failed: ${detail}`)
+  } else {
+    $.ui.log(`background ledger prep failed: ${detail}`, { to: 'debug' })
+  }
+}
 
 function resetBackgroundState(): void {
   sessionGen++
   preparing = false
   pendingCatchUp = undefined
+  lastPrepStatus = undefined
+  lastLoggedPrepError = undefined
 }
 
 function prepareInBackground($: EngineInterface, session: string, target?: PrepareTarget): void {
   if (preparing) {
     // Do not lose a post-compaction catch-up if pre-compaction prep is still finishing.
-    if (target?.through !== undefined) pendingCatchUp = { session, through: target.through }
+    if (target?.through !== undefined) {
+      pendingCatchUp = { session, through: target.through, ...(target.overhead !== undefined ? { overhead: target.overhead } : {}) }
+    }
     return
   }
   preparing = true
   const gen = sessionGen
   $.clock.after(0, () => {
     if (gen !== sessionGen) return
-    prepareLedger($, session, target)
-      .catch(error => $.ui.log(`ledger prep failed: ${describe(error)}`, { to: 'debug' }))
+    prepareLedger($, session, target, gen)
+      .catch(error => reportPrepFailure($, describe(error), gen))
       .finally(() => {
         if (gen !== sessionGen) return
         preparing = false
         const queued = pendingCatchUp
         pendingCatchUp = undefined
-        if (queued) prepareInBackground($, queued.session, { through: queued.through })
+        if (queued) prepareInBackground($, queued.session, { through: queued.through, ...(queued.overhead !== undefined ? { overhead: queued.overhead } : {}) })
       })
   })
 }
@@ -408,19 +466,25 @@ export async function strataCompact(
     messages.push(message)
   }
   const k = (chars: number) => `${Math.round(chars / CHARS_PER_KTOKEN)}k`
-  const { rawChars, outputChars, matched, previousOutput, cut, ledgerThrough, hiddenChars, mediaSaved } = result.stats
+  const { rawChars, outputChars, matched, recoveredTail, previousOutput, cut, ledgerThrough, hiddenChars, mediaSaved } = result.stats
   const reportedError = result.stats.ledgerError ?? ledgerError
   const notes = [
     hiddenChars ? `${k(hiddenChars)} of it images/thinking` : '',
     mediaSaved ? `${mediaSaved} images archived` : '',
-    matched < previousOutput ? `only ${matched}/${previousOutput} of the last output was recognised; the rest was archived as new` : '',
+    recoveredTail
+      ? `recovered branch from ${matched} tail rows after truncated resume`
+      : matched < previousOutput
+        ? `only ${matched}/${previousOutput} of the last output was recognised; the rest was archived as new`
+        : '',
     ledgerThrough < cut ? `ledger lags the cut by ${cut - ledgerThrough} messages` : '',
     reportedError ? `ledger not updated: ${reportedError}` : ''
   ].filter(Boolean)
   $.ui.log(`${k(rawChars)} branch text -> ${k(outputChars)} live${notes.length ? ` (${notes.join('; ')})` : ''}`)
   // A ready-mode compaction can leave the ledger behind the cut: catch it up
   // in the background through the exact committed cut.
-  if (ledgerThrough < cut && (await thresholds($)).auto) prepareInBackground($, session, { through: cut })
+  if (ledgerThrough < cut && (await thresholds($)).auto) {
+    prepareInBackground($, session, { through: cut, ...(hidden.usage?.overhead ? { overhead: hidden.usage.overhead } : {}) })
+  }
   return { messages }
 }
 
@@ -568,7 +632,7 @@ export const register: Register = on => {
         `archive: ${s.archiveCount} messages (${kb} KB), ${s.mediaCount} media files, active branch ${s.branchLength} rows`,
         `compactions: ${s.compactions}${s.lastCut !== undefined ? ` (last cut at row ${s.lastCut})` : ''}`,
         ledgerLine,
-        `${readyLine} | background prep: ${preparing ? 'running' : 'idle'}`
+        `${readyLine} | background prep: ${preparing ? 'running' : 'idle'}${lastPrepStatus ? ` (${lastPrepStatus})` : ''}`
       ].join('\n')
     }
   }).catch(() => ({ text: 'strata: failed to read status' }))

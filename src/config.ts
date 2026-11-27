@@ -68,6 +68,35 @@ export function estimateTokens(chars: number): number {
   return Math.ceil(chars / CHARS_PER_TOKEN)
 }
 
+/** Floor share of budgetTokens kept for messages even when static overhead is very large. */
+const MIN_MESSAGE_BUDGET_SHARE = 0.25
+
+/**
+ * Message token budget after subtracting static non-message overhead (system
+ * prompt, tool schemas, memory files) when the engine reports it. Reserves at
+ * least 25% of `budgetTokens` for messages so huge tool lists never collapse
+ * the budget to zero.
+ */
+export function effectiveBudgetTokens(config: Config, overheadTokens?: number): number {
+  if (overheadTokens === undefined || !Number.isFinite(overheadTokens) || overheadTokens <= 0) {
+    return config.budgetTokens
+  }
+  const floor = Math.max(1, Math.round(config.budgetTokens * MIN_MESSAGE_BUDGET_SHARE))
+  return Math.max(floor, config.budgetTokens - Math.round(overheadTokens))
+}
+
+/** Config adjusted for reported static overhead (rescaling `budgetTokens` and default `prepareMinChars`). */
+export function withEffectiveBudget(config: Config, overheadTokens?: number): Config {
+  const effectiveTokens = effectiveBudgetTokens(config, overheadTokens)
+  if (effectiveTokens === config.budgetTokens) return config
+  const defaultMin = Math.round(config.budgetTokens * CHARS_PER_TOKEN * PREPARE_MIN_SHARE)
+  const prepareMinChars =
+    config.prepareMinChars === defaultMin
+      ? Math.round(effectiveTokens * CHARS_PER_TOKEN * PREPARE_MIN_SHARE)
+      : config.prepareMinChars
+  return { ...config, budgetTokens: effectiveTokens, prepareMinChars }
+}
+
 export function budgetChars(config: Config): number {
   return config.budgetTokens * CHARS_PER_TOKEN
 }

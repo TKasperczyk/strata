@@ -84,15 +84,20 @@ describe('archive query, search, and status', () => {
     await compact({ sessionKey: SESSION, messages: rewound, showCommand: SHOW }, config, noLedger)
     const sdir = join(dir, 'sessions', SESSION)
 
-    // Active branch only: does not find the abandoned branch's error unless all-branches is set.
+    // Active branch only: does not find the abandoned branch's error unless all-branches is set,
+    // and notes how many off-branch archived messages were skipped.
     const activeOnly = searchArchive(sdir, { query: 'ECONNREFUSED' })
     expect(activeOnly.branchScoped).toBe(true)
+    expect(activeOnly.offBranchCount).toBeGreaterThan(0)
     expect(activeOnly.totalMatches).toBe(0)
+    expect(activeOnly.formatted).toContain('outside active branch skipped (include with all_branches=true or --all-branches)')
 
     const allBranches = searchArchive(sdir, { query: 'ECONNREFUSED', branchOnly: false, errorsOnly: true })
     expect(allBranches.branchScoped).toBe(false)
+    expect(allBranches.offBranchCount).toBe(0)
     expect(allBranches.totalMatches).toBe(1)
     expect(allBranches.matches[0].hasError).toBe(true)
+    expect(allBranches.formatted).not.toContain('outside active branch skipped')
 
     const regexHit = searchArchive(sdir, { query: 'port \\d{4}', regex: true, role: 'assistant' })
     expect(regexHit.totalMatches).toBe(1)

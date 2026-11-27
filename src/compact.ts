@@ -1,13 +1,13 @@
 import { mkdirSync, writeFileSync } from 'fs'
 import { join } from 'path'
-import { appendArchive, archivePath, fingerprint, matchedPrefix, numberMessages, readArchive, readState, sessionDir, writeState } from './archive.js'
-import { budgetChars, shareChars, type Config } from './config.js'
+import { appendArchive, archivePath, fingerprint, matchedPrefix, matchedResumedTail, numberMessages, readArchive, readState, sessionDir, writeState } from './archive.js'
+import { budgetChars, shareChars, withEffectiveBudget, type Config } from './config.js'
 import { renderEpisode, renderIndex, segmentEpisodes } from './episodes.js'
 import { LEDGER_SYSTEM_PROMPT, ledgerMaskConfig, ledgerMaxTokens, ledgerRequests, renderSpan, trimLedger, updateLedger, type LedgerUpdate } from './ledger.js'
 import { maskMessage, messageChars, renderMessage, safeSlicePrefix } from './mask.js'
 import { acquireLock, compatibleReady, prefixHash, tryLock, writeReady } from './ready.js'
 import { HEADER_MARK, type ArchivedMessage, type Message, type OutputEntry, type OutputRecord, type SessionState } from './types.js'
-import { isPrompt as isUnitPrompt, rebuildUnit, segmentUnits, type Unit } from './units.js'
+import { isPrompt as isUnitPrompt, isToolResultRow, rebuildToolResultRow, rebuildUnit, segmentUnits, type Unit } from './units.js'
 import { calibratedTextChars, calibrateWeights, hiddenByRow, hiddenChars, type ApiMessage, type Hidden, type UsageReading } from './weights.js'
 
 export { HEADER_MARK }
@@ -48,6 +48,8 @@ export type CompactInput = {
    */
   api?: ApiMessage[]
   usage?: UsageReading
+  /** Optional byte ceiling on serialized `CompactResult` JSON (e.g. Claude Code's 4 MiB stdout cap). Checked before committing state. */
+  maxOutputBytes?: number
 }
 
 export type PrepareInput =
@@ -56,6 +58,8 @@ export type PrepareInput =
       sessionKey: string
       /** Explicit committed branch row count to catch the ledger up through (reads archive + state directly). */
       through: number
+      /** Static non-message overhead tokens so catch-up ledger sizing matches the effective budget. */
+      overheadTokens?: number
       instructions?: string
       showCommand?: string
     }
@@ -67,6 +71,8 @@ export type CompactStats = {
   matched: number
   /** True when the whole last output came back unchanged (the normal case). */
   matchedPrevious: boolean
+  /** True when continuity was recovered from a truncated `--resume` tail. */
+  recoveredTail?: boolean
   /** Length of the last output (0 on a session's first compaction). */
   previousOutput: number
   branch: number
@@ -139,6 +145,25 @@ function isPrompt(m: Message): boolean {
   return m.role === 'user' && m.text.trim() !== '' && !(m.toolResults?.length)
 }
 
+/** Wrapper messages that do not start a new user turn mid-tool-loop. */
+const NON_TURN_WRAPPER_RE =
+  /^(?:<(?:local-command-[a-z-]+|task-notification|system-reminder|teammate-message|bash-notification|scheduled-task|user-prompt-submit-hook|agent-notification)\b|\[(?:Request interrupted|Orphaned tool result))/i
+
+/** Command wrappers that should not be pinned as `## Original request` unless they carry user arguments. */
+const COMMAND_WRAPPER_RE = /^<(?:command-name|command-message|command-args|bash-input)\b/i
+const NON_EMPTY_COMMAND_ARGS_RE = /<command-args>\s*\S[\s\S]*?<\/command-args>/i
+
+function isTurnPrompt(m: Message): boolean {
+  return isPrompt(m) && !NON_TURN_WRAPPER_RE.test(m.text.trimStart())
+}
+
+function isOriginalRequest(m: Message): boolean {
+  if (!isTurnPrompt(m)) return false
+  const trimmed = m.text.trimStart()
+  if (COMMAND_WRAPPER_RE.test(trimmed)) return NON_EMPTY_COMMAND_ARGS_RE.test(trimmed)
+  return true
+}
+
 type Reconciled = {
   all: ArchivedMessage[]
   bySeq: Map<number, ArchivedMessage>
@@ -148,6 +173,7 @@ type Reconciled = {
   /** Input index of each archive seq the engine handed over as its own message. */
   inputBySeq: Map<number, number>
   matched: number
+  recoveredTail: boolean
   /** The branch no longer holds everything the ledger was built from. */
   ledgerStale: boolean
 }
@@ -156,17 +182,40 @@ type Reconciled = {
  * Work out the active branch from the input. The leading messages that repeat
  * our last output stand for the branch prefix they covered (all of it when the
  * whole output came back; less after a rewind); everything after them is new.
+ * If a `--resume` truncated the header/middle and left only the kept tail of
+ * `state.lastOutput`, recover the prior branch instead of discarding history.
  */
 function reconcile(dir: string, input: Message[], state: SessionState): Reconciled {
   const archive = readArchive(dir)
-  const matched = matchedPrefix(input, state)
-  const base = matched > 0 ? state.branch.slice(0, state.lastOutput[matched - 1].upto) : []
-  const inputBySeq = new Map<number, number>()
-  for (let i = 0; i < matched; i++) {
-    if (state.lastOutput[i].seq >= 0) inputBySeq.set(state.lastOutput[i].seq, i)
+  let matched = matchedPrefix(input, state)
+  // Never stop mid-unit on a multi-message rebuilt unit (records sharing `upto`):
+  // accepting only the assistant half would pull the abandoned result into `base`
+  // before `fresh` appends the replacement result.
+  if (matched > 0 && matched < state.lastOutput.length && state.lastOutput[matched - 1].upto === state.lastOutput[matched].upto) {
+    const partialUpto = state.lastOutput[matched - 1].upto
+    while (matched > 0 && state.lastOutput[matched - 1].upto === partialUpto) matched--
   }
+  const resumed = matched === 0 ? matchedResumedTail(input, state) : undefined
+  const base =
+    matched > 0
+      ? state.branch.slice(0, state.lastOutput[matched - 1].upto)
+      : resumed
+        ? state.branch.slice(0, state.lastOutput[state.lastOutput.length - 1].upto)
+        : []
+  const inputBySeq = new Map<number, number>()
+  if (matched > 0) {
+    for (let i = 0; i < matched; i++) {
+      if (state.lastOutput[i].seq >= 0) inputBySeq.set(state.lastOutput[i].seq, i)
+    }
+  } else if (resumed) {
+    for (let k = 0; k < resumed.count; k++) {
+      const rec = state.lastOutput[resumed.outputStart + k]
+      if (rec.seq >= 0) inputBySeq.set(rec.seq, resumed.inputStart + k)
+    }
+  }
+  const freshStart = resumed ? resumed.inputStart + resumed.count : matched
   // A stray header of ours past the matched part is derived content, never history.
-  const fresh = input.map((_, i) => i).slice(matched).filter(i => !input[i].text.startsWith(HEADER_MARK))
+  const fresh = input.map((_, i) => i).slice(freshStart).filter(i => !input[i].text.startsWith(HEADER_MARK))
   const nextSeq = archive.reduce((max, m) => Math.max(max, m.seq + 1), archive.length)
   const pending = numberMessages(nextSeq, fresh.map(i => input[i]))
   fresh.forEach((inputIndex, k) => inputBySeq.set(pending[k].seq, inputIndex))
@@ -179,7 +228,8 @@ function reconcile(dir: string, input: Message[], state: SessionState): Reconcil
     pending,
     branch,
     inputBySeq,
-    matched,
+    matched: resumed ? resumed.count : matched,
+    recoveredTail: Boolean(resumed),
     ledgerStale: base.length < state.ledgerThrough
   }
 }
@@ -199,7 +249,7 @@ function buildHeader(
   ledgerThrough: number,
   config: Config
 ): string {
-  const pinned = evicted.find(isPrompt)
+  const pinned = evicted.find(isOriginalRequest) ?? evicted.find(isPrompt)
   const sections = [headerPreamble(input, dir)]
   if (pinned) sections.push(`## Original request (seq ${pinned.seq})\n${safeSlicePrefix(pinned.text, shareChars(config, 'pinned'))}`)
   if (ledger) {
@@ -310,28 +360,69 @@ function layout(
   return { cut, tail }
 }
 
+function isThinkingOnlyRow(m: Message): boolean {
+  return m.role === 'assistant' && !m.text.trim() && m.toolUses.length === 0
+}
+
+function unitHasOpenCall(rows: Message[], u: Unit): boolean {
+  const open = new Set<string>()
+  for (let i = u.start; i < u.end; i++) {
+    for (const c of rows[i].toolUses) open.add(c.tool_use_id)
+    for (const r of rows[i].toolResults ?? []) open.delete(r.tool_use_id)
+  }
+  return open.size > 0
+}
+
 /**
- * The first unit that must stay verbatim, and whether it is protected for its
- * thinking: the unit holding the latest response's opening thinking row (an
- * assistant row with no text and no calls), else the last unit. Rebuilt
- * messages lose thinking blocks, and with manual extended thinking the final
- * assistant turn must keep its own.
+ * The first unit that must stay verbatim, whether the latest turn after the
+ * last real user prompt is still in-flight (`midTurn`), and whether it must
+ * keep its opening thinking row by handle (`thinking`). Rebuilt messages drop
+ * thinking blocks; with extended thinking an in-flight turn's assistant
+ * messages must keep theirs, while completed turns before the next user prompt
+ * do not need them. Detects thinking from both bare thinking rows and the API
+ * form's per-row thinking weight, and ignores synthetic notification wrappers
+ * when locating the active turn's opening prompt.
  */
-function protectedUnit(rows: Message[], units: Unit[]): { from: number; thinking: boolean } {
+function protectedUnit(
+  rows: ArchivedMessage[],
+  units: Unit[],
+  hidden: Map<number, Hidden>,
+  inputBySeq: Map<number, number>
+): { from: number; thinking: boolean; midTurn: boolean } {
   let lastPrompt = -1
   rows.forEach((m, i) => {
-    if (isUnitPrompt(m)) lastPrompt = i
+    if (isTurnPrompt(m)) lastPrompt = i
   })
+  const tail = rows.slice(lastPrompt + 1)
+  if (tail.length === 0) return { from: units.length - 1, thinking: false, midTurn: false }
+  const open = new Set<string>()
+  for (const m of tail) {
+    for (const u of m.toolUses) open.add(u.tool_use_id)
+    for (const r of m.toolResults ?? []) open.delete(r.tool_use_id)
+  }
+  const lastNonWrapper = [...tail].reverse().find(m => !(isUnitPrompt(m) && !isTurnPrompt(m)))
+  if (!lastNonWrapper) return { from: units.length - 1, thinking: false, midTurn: false }
+  const midTurn = open.size > 0 || isToolResultRow(lastNonWrapper) || isThinkingOnlyRow(lastNonWrapper)
+  if (!midTurn) return { from: units.length - 1, thinking: false, midTurn: false }
+
+  const hasThinking = (rowIndex: number): boolean => {
+    const m = rows[rowIndex]
+    if (isThinkingOnlyRow(m)) return true
+    const inputIdx = inputBySeq.get(m.seq)
+    return inputIdx !== undefined && (hidden.get(inputIdx)?.thinkingChars ?? 0) > 0
+  }
+
+  // Scan forward from `lastPrompt + 1` so multi-step in-flight turns preserve
+  // thinking from their first thinking-bearing unit onward.
   let thinking = -1
-  for (let i = rows.length - 1; i > lastPrompt; i--) {
-    const m = rows[i]
-    if (m.role === 'assistant' && !m.text.trim() && m.toolUses.length === 0) {
+  for (let i = lastPrompt + 1; i < rows.length; i++) {
+    if (hasThinking(i)) {
       thinking = i
       break
     }
   }
-  if (thinking < 0) return { from: units.length - 1, thinking: false }
-  return { from: units.findIndex(u => u.start <= thinking && thinking < u.end), thinking: true }
+  if (thinking < 0) return { from: units.length - 1, thinking: false, midTurn: true }
+  return { from: units.findIndex(u => u.start <= thinking && thinking < u.end), thinking: true, midTurn: true }
 }
 
 type LedgerState = { ledger: string; ledgerThrough: number; ledgerAge: number; requests: number; error?: string }
@@ -470,6 +561,8 @@ async function advanceLedger(
 }
 
 type Plan = {
+  /** Config with budgetTokens adjusted for reported static overhead. */
+  config: Config
   hidden: Map<number, Hidden>
   ratio: number
   charsPerToken: number
@@ -495,7 +588,8 @@ type Plan = {
 
 /** Everything a compaction decides, computed without writing anything. */
 function planCompaction(input: CompactInput, config: Config, reserveFullLedger?: boolean): Plan {
-  const dir = sessionDir(config.dataDir, input.sessionKey)
+  const effectiveConfig = withEffectiveBudget(config, input.usage?.overhead)
+  const dir = sessionDir(effectiveConfig.dataDir, input.sessionKey)
   const state = readState(dir)
   const reconciled = reconcile(dir, input.messages, state)
   const { bySeq, branch, inputBySeq, pending, ledgerStale } = reconciled
@@ -515,29 +609,51 @@ function planCompaction(input: CompactInput, config: Config, reserveFullLedger?:
     })
   }
   const rows = branch.map(seq => bySeq.get(seq)!)
-  const units = segmentUnits(rows, rows.map(m => inputBySeq.has(m.seq)))
+  // User tool_result rows are always emitted as hook-built rows (to avoid Claude
+  // Code's `sourceToolAssistantUUID` parentUuid jump across `compact_boundary`),
+  // so they follow their exchange's handle state rather than requiring one.
+  const rowWhole: boolean[] = []
+  for (let i = 0; i < rows.length; i++) {
+    const m = rows[i]
+    rowWhole.push(isToolResultRow(m) ? i > 0 && rowWhole[i - 1] : inputBySeq.has(m.seq))
+  }
+  const units = segmentUnits(rows, rowWhole)
   if (units.length === 0) throw new Error('nothing to compact')
 
-  // Size each unit as it would actually be emitted: the engine's own rows when
-  // every row has a handle (unanswered calls included), else the rebuild.
-  const handles = units.map(u => rows.slice(u.start, u.end).map(m => inputBySeq.get(m.seq)))
-  const whole = handles.map(h => h.every(i => i !== undefined))
-  const guard = protectedUnit(rows, units)
-  if (guard.thinking && whole.slice(guard.from).some(w => !w)) {
+  // Size each unit as it would actually be emitted. User prompts keep their
+  // engine handles (preserving pasted images and providing kept anchors);
+  // completed exchanges are emitted raw via `rawBuilt` so every assistant row
+  // gets a fresh `message.id` (avoiding Claude Code's `AGn`/`RRr` duplicate
+  // recovery on `--resume`) and every `tool_result` row omits stale
+  // `sourceToolAssistantUUID` pointers (avoiding `parentUuid` jumps across
+  // `compact_boundary`). Only in-flight mid-turn exchanges with active
+  // thinking or an unanswered tool call keep assistant handles.
+  const handles = units.map(u => rows.slice(u.start, u.end).map(m => (isToolResultRow(m) ? undefined : inputBySeq.get(m.seq))))
+  const engineWhole = units.map((u, k) => rows.slice(u.start, u.end).every((m, j) => isToolResultRow(m) || handles[k][j] !== undefined))
+  const guard = protectedUnit(rows, units, hidden, inputBySeq)
+  if (guard.thinking && engineWhole.slice(guard.from).some(w => !w)) {
     throw new UnpreservableError('the latest response opens with thinking that only the engine still holds, and part of it was already rebuilt')
   }
-  const rawBuilt = units.map(u => rebuildUnit(rows.slice(u.start, u.end), 'raw', config))
-  const maskedBuilt = units.map(u => rebuildUnit(rows.slice(u.start, u.end), 'masked', config))
+  const whole = units.map((u, k) => {
+    if (!engineWhole[k]) return false
+    if (u.kind === 'prompt') return true
+    return guard.midTurn && k >= guard.from && (guard.thinking || unitHasOpenCall(rows, u))
+  })
+  const rawBuilt = units.map(u => rebuildUnit(rows.slice(u.start, u.end), 'raw', effectiveConfig))
+  const maskedBuilt = units.map(u => rebuildUnit(rows.slice(u.start, u.end), 'masked', effectiveConfig))
   const scaledMessagesChars = (msgs: Message[]) =>
     msgs.reduce((n, m) => n + calibratedTextChars(messageChars(m), charsPerToken), 0)
   const maskedSizes = maskedBuilt.map(scaledMessagesChars)
-  // Rows kept whole carry images, thinking, and real text density; rebuilt body rows carry calibrated text density too.
+  // Kept rows carry images, thinking, and real text density; rebuilt tool_result
+  // rows and rebuilt units carry calibrated text density (with media pointers).
   const rowChars = (m: ArchivedMessage) =>
-    calibratedTextChars(messageChars(m), charsPerToken) + hiddenChars(hidden.get(inputBySeq.get(m.seq)!), ratio)
+    isToolResultRow(m)
+      ? calibratedTextChars(messageChars(rebuildToolResultRow(m)), charsPerToken)
+      : calibratedTextChars(messageChars(m), charsPerToken) + hiddenChars(hidden.get(inputBySeq.get(m.seq)!), ratio)
   const verbatim = units.map((u, k) => (whole[k] ? rows.slice(u.start, u.end).reduce((n, m) => n + rowChars(m), 0) : scaledMessagesChars(rawBuilt[k])))
   const base = bestLedger(dir, state, rows, ledgerStale)
-  const budget = budgetChars(config)
-  const ledgerCap = shareChars(config, 'ledger')
+  const budget = budgetChars(effectiveConfig)
+  const ledgerCap = shareChars(effectiveConfig, 'ledger')
 
   // Adopt a valid host-computed ledger right here so layout sizes against its
   // actual length and exact `ledgerThrough` instead of wasting the full 6% cap.
@@ -562,14 +678,14 @@ function planCompaction(input: CompactInput, config: Config, reserveFullLedger?:
     // huge placeholder strings (or hitting RangeError on extreme budgets).
     const placeholder = ledgerChars > 0 ? 'x' : ''
     const ledgerExtra = ledgerChars > 0 ? ledgerChars - 1 : 0
-    const indexCap = shareChars(config, 'index')
+    const indexCap = shareChars(effectiveConfig, 'index')
     return (cut: number): number => {
       if (cut <= 0) return 0
       const hit = cache.get(cut)
       if (hit !== undefined) return hit
       const evicted = rows.slice(0, units[cut].start)
       if (!fullReserve) {
-        const size = buildHeader(input, dir, evicted, placeholder, knownLedger.ledgerThrough, config).length + ledgerExtra
+        const size = buildHeader(input, dir, evicted, placeholder, knownLedger.ledgerThrough, effectiveConfig).length + ledgerExtra
         cache.set(cut, size)
         return size
       }
@@ -581,10 +697,10 @@ function planCompaction(input: CompactInput, config: Config, reserveFullLedger?:
       const baseProtect = base.ledgerThrough < evicted.length ? evicted[base.ledgerThrough]?.seq : undefined
       const baseIdxLen = renderIndex(episodes, indexCap, { protectAfterSeq: baseProtect }).length
       const indexSlack = fullIdxLen > indexCap ? Math.max(0, indexCap - baseIdxLen) : 0
-      let size = buildHeader(input, dir, evicted, placeholder, base.ledgerThrough, config).length + ledgerExtra + indexSlack
+      let size = buildHeader(input, dir, evicted, placeholder, base.ledgerThrough, effectiveConfig).length + ledgerExtra + indexSlack
       if (placeholder && base.ledgerThrough < evicted.length && evicted.length > 1) {
         // Also bound the lag notice with the widest seq numbers in `evicted`.
-        const maxLagHeader = buildHeader(input, dir, evicted, placeholder, evicted.length - 1, config).length + ledgerExtra
+        const maxLagHeader = buildHeader(input, dir, evicted, placeholder, evicted.length - 1, effectiveConfig).length + ledgerExtra
         const lagProtect = evicted[evicted.length - 1]?.seq
         const lagIdxLen = renderIndex(episodes, indexCap, { protectAfterSeq: lagProtect }).length
         const lagSlack = fullIdxLen > indexCap ? Math.max(0, indexCap - lagIdxLen) : 0
@@ -598,12 +714,13 @@ function planCompaction(input: CompactInput, config: Config, reserveFullLedger?:
   // Leave the ledger its room when possible; squeeze it out before giving up.
   let picked: Layout
   try {
-    picked = layout(verbatim, maskedSizes, guard.from, makeHeaderSizer(preferredLedgerChars), budget, config)
+    picked = layout(verbatim, maskedSizes, guard.from, makeHeaderSizer(preferredLedgerChars), budget, effectiveConfig)
   } catch (error) {
     if (!(error instanceof OversizeError) || preferredLedgerChars === 0) throw error
-    picked = layout(verbatim, maskedSizes, guard.from, makeHeaderSizer(0), budget, config)
+    picked = layout(verbatim, maskedSizes, guard.from, makeHeaderSizer(0), budget, effectiveConfig)
   }
   return {
+    config: effectiveConfig,
     hidden,
     ratio,
     charsPerToken,
@@ -631,6 +748,7 @@ export async function compact(input: CompactInput, config: Config, ledgerFn: Led
   const release = await acquireLock(dir, 'compact.lock')
   try {
     const plan = planCompaction(input, config)
+    const effectiveConfig = plan.config
     const {
       state,
       rows,
@@ -651,9 +769,9 @@ export async function compact(input: CompactInput, config: Config, ledgerFn: Led
       charsPerToken,
       mediaWrites
     } = plan
-    const { all, pending, branch, matched } = plan.reconciled
+    const { all, pending, branch, matched, recoveredTail } = plan.reconciled
     const tailRow = units[tail].start
-    const budget = budgetChars(config)
+    const budget = budgetChars(effectiveConfig)
 
     let ledger: LedgerState
     if (adoptedLedger) {
@@ -663,7 +781,7 @@ export async function compact(input: CompactInput, config: Config, ledgerFn: Led
     } else if (input.ledgerMode === 'ready') {
       ledger = base
     } else {
-      ledger = await advanceLedger(base, rows, cutRow, config, ledgerFn, input.instructions)
+      ledger = await advanceLedger(base, rows, cutRow, effectiveConfig, ledgerFn, input.instructions)
     }
 
     const entries: OutputEntry[] = []
@@ -688,20 +806,29 @@ export async function compact(input: CompactInput, config: Config, ledgerFn: Led
     for (let u = tail; u < units.length; u++) {
       const { start, end } = units[u]
       if (whole[u]) {
-        // The engine's own rows, whole and in order: thinking, images and response grouping intact.
+        // Keep prompts and assistant turns by handle (thinking, pasted images,
+        // response grouping intact), while rebuilding tool_result rows raw so
+        // Claude Code's cloner cannot carry stale `sourceToolAssistantUUID`
+        // pointers across `compact_boundary` and break `--resume`.
         handles[u].forEach((inputIndex, k) => {
-          body.push(() => {
-            entries.push({ keep: inputIndex! })
-            records.push({
-              fp: fingerprint(input.messages[inputIndex!]),
-              upto: start + k + 1,
-              seq: rows[start + k].seq,
-              role: rows[start + k].role
+          const row = rows[start + k]
+          if (isToolResultRow(row)) {
+            const built = rebuildToolResultRow(row)
+            body.push(() => emitBuilt(built, start + k + 1, 'tail'))
+          } else {
+            body.push(() => {
+              entries.push({ keep: inputIndex! })
+              records.push({
+                fp: fingerprint(input.messages[inputIndex!]),
+                upto: start + k + 1,
+                seq: row.seq,
+                role: row.role
+              })
+              const extra = hiddenChars(hidden.get(inputIndex!), ratio)
+              tailHidden += extra
+              layers.tail += calibratedTextChars(messageChars(row), charsPerToken) + extra
             })
-            const extra = hiddenChars(hidden.get(inputIndex!), ratio)
-            tailHidden += extra
-            layers.tail += calibratedTextChars(messageChars(rows[start + k]), charsPerToken) + extra
-          })
+          }
         })
       } else {
         for (const m of rawBuilt[u]) body.push(() => emitBuilt(m, end, 'tail'))
@@ -710,38 +837,27 @@ export async function compact(input: CompactInput, config: Config, ledgerFn: Led
     if (cutRow > 0) {
       const evicted = rows.slice(0, cutRow)
       const bodyChars = maskedSizes.slice(cut, tail).reduce((a, b) => a + b, 0) + verbatim.slice(tail).reduce((a, b) => a + b, 0)
-      const emptyHeader = buildHeader(input, dir, evicted, '', ledger.ledgerThrough, config).length
-      const probeHeader = buildHeader(input, dir, evicted, 'x', ledger.ledgerThrough, config).length
+      const emptyHeader = buildHeader(input, dir, evicted, '', ledger.ledgerThrough, effectiveConfig).length
+      const probeHeader = buildHeader(input, dir, evicted, 'x', ledger.ledgerThrough, effectiveConfig).length
       const ledgerWrapper = probeHeader - emptyHeader - 1
-      const shown = fitLedger(ledger.ledger, budget - bodyChars - emptyHeader - ledgerWrapper)
-      emitBuilt({ role: 'user', text: buildHeader(input, dir, evicted, shown, ledger.ledgerThrough, config), toolUses: [] }, cutRow, 'header')
+      const ledgerCap = shareChars(effectiveConfig, 'ledger')
+      const shown = fitLedger(ledger.ledger, Math.min(ledgerCap, budget - bodyChars - emptyHeader - ledgerWrapper))
+      emitBuilt({ role: 'user', text: buildHeader(input, dir, evicted, shown, ledger.ledgerThrough, effectiveConfig), toolUses: [] }, cutRow, 'header')
     }
     for (const emit of body) emit()
 
+    if (entries.length === 0) throw new DeclineError('compaction produced no messages')
     const outputChars = layers.header + layers.middle + layers.tail
     if (outputChars > budget) throw new OversizeError(`assembled output is ${outputChars} chars, over the ${budget}-char budget`)
 
-    // Commit only now: a rejected compaction leaves archive and state untouched.
-    if (mediaWrites.length) mkdirSync(join(dir, 'media'), { recursive: true })
-    for (const { path, data } of mediaWrites) writeFileSync(path, Buffer.from(data, 'base64'))
-    appendArchive(dir, pending)
-    writeState(dir, {
-      branch,
-      lastOutput: records,
-      ledger: ledger.ledger,
-      ledgerThrough: ledger.ledgerThrough,
-      ledgerAge: ledger.ledgerAge,
-      compactions: state.compactions + 1,
-      lastCut: cutRow
-    })
-
-    return {
+    const result: CompactResult = {
       entries,
       stats: {
         archived: all.length,
         newRaw: pending.length,
         matched,
         matchedPrevious: state.lastOutput.length > 0 && matched === state.lastOutput.length,
+        ...(recoveredTail ? { recoveredTail: true } : {}),
         previousOutput: state.lastOutput.length,
         branch: branch.length,
         cut: cutRow,
@@ -758,6 +874,29 @@ export async function compact(input: CompactInput, config: Config, ledgerFn: Led
         ...(ledger.error ? { ledgerError: ledger.error } : {})
       }
     }
+
+    if (input.maxOutputBytes !== undefined) {
+      const serializedBytes = Buffer.byteLength(JSON.stringify(result), 'utf-8')
+      if (serializedBytes > input.maxOutputBytes) {
+        throw new OversizeError(`serialized compaction output is ${serializedBytes} bytes, over the ${input.maxOutputBytes}-byte transport limit`)
+      }
+    }
+
+    // Commit only now: a rejected compaction leaves archive and state untouched.
+    if (mediaWrites.length) mkdirSync(join(dir, 'media'), { recursive: true })
+    for (const { path, data } of mediaWrites) writeFileSync(path, Buffer.from(data, 'base64'))
+    appendArchive(dir, pending)
+    writeState(dir, {
+      branch,
+      lastOutput: records,
+      ledger: ledger.ledger,
+      ledgerThrough: ledger.ledgerThrough,
+      ledgerAge: ledger.ledgerAge,
+      compactions: state.compactions + 1,
+      lastCut: cutRow
+    })
+
+    return result
   } finally {
     release()
   }
@@ -766,19 +905,20 @@ export async function compact(input: CompactInput, config: Config, ledgerFn: Led
 function resolvePrepareTarget(
   input: PrepareInput,
   config: Config
-): { dir: string; rows: ArchivedMessage[]; cutRow: number; base: LedgerState; enforceMinChars: boolean } {
+): { dir: string; rows: ArchivedMessage[]; cutRow: number; base: LedgerState; enforceMinChars: boolean; config: Config } {
   if ('through' in input && input.through !== undefined) {
-    const dir = sessionDir(config.dataDir, input.sessionKey)
+    const effectiveConfig = withEffectiveBudget(config, input.overheadTokens)
+    const dir = sessionDir(effectiveConfig.dataDir, input.sessionKey)
     const state = readState(dir)
     const archive = readArchive(dir)
     const bySeq = new Map<number, ArchivedMessage>(archive.map(m => [m.seq, m]))
     const rows = state.branch.map(seq => bySeq.get(seq)).filter((m): m is ArchivedMessage => m !== undefined)
     const cutRow = Math.min(Math.max(0, Math.floor(input.through)), rows.length)
     const base = bestLedger(dir, state, rows, false)
-    return { dir, rows, cutRow, base, enforceMinChars: false }
+    return { dir, rows, cutRow, base, enforceMinChars: false, config: effectiveConfig }
   }
   const plan = planCompaction(input, config, true)
-  return { dir: plan.dir, rows: plan.rows, cutRow: plan.cutRow, base: plan.base, enforceMinChars: true }
+  return { dir: plan.dir, rows: plan.rows, cutRow: plan.cutRow, base: plan.base, enforceMinChars: true, config: plan.config }
 }
 
 /**
@@ -789,9 +929,9 @@ function resolvePrepareTarget(
 export function planLedger(input: PrepareInput, config: Config, options: { enforceMinChars?: boolean } = {}): LedgerPlan {
   const target = resolvePrepareTarget(input, config)
   const enforceMinChars = options.enforceMinChars ?? target.enforceMinChars
-  const { work, reason } = chooseLedgerWork(target.base, target.rows, target.cutRow, config, input.instructions, enforceMinChars)
+  const { work, reason } = chooseLedgerWork(target.base, target.rows, target.cutRow, target.config, input.instructions, enforceMinChars)
   if (!work) return { needed: false, reason: reason ?? 'nothing new to fold in' }
-  const maxChars = shareChars(config, 'ledger')
+  const maxChars = shareChars(target.config, 'ledger')
   return {
     needed: true,
     previous: work.previous,
@@ -800,7 +940,7 @@ export function planLedger(input: PrepareInput, config: Config, options: { enfor
     maxChars,
     maxTokens: ledgerMaxTokens(maxChars),
     system: LEDGER_SYSTEM_PROMPT,
-    model: config.ledgerModel,
+    model: target.config.ledgerModel,
     through: work.targetThrough,
     prefixHash: prefixHash(target.rows, work.targetThrough),
     age: work.nextAge
@@ -820,12 +960,12 @@ export type PrepareResult =
 export async function prepare(input: PrepareInput, config: Config, ledgerFn: LedgerFn = updateLedger): Promise<PrepareResult> {
   const target = resolvePrepareTarget(input, config)
   const { dir, rows, cutRow, base, enforceMinChars } = target
-  const { work, reason } = chooseLedgerWork(base, rows, cutRow, config, input.instructions, enforceMinChars)
+  const { work, reason } = chooseLedgerWork(base, rows, cutRow, target.config, input.instructions, enforceMinChars)
   if (!work) return { prepared: false, reason: reason ?? 'nothing new to fold in' }
   const release = tryLock(dir)
   if (!release) return { prepared: false, reason: 'another prepare job is running' }
   try {
-    const next = await advanceLedger(base, rows, cutRow, config, ledgerFn, input.instructions)
+    const next = await advanceLedger(base, rows, cutRow, target.config, ledgerFn, input.instructions)
     if (next.error) return { prepared: false, reason: `ledger update failed: ${next.error}` }
     if (next.ledgerThrough === base.ledgerThrough && next.ledger === base.ledger) return { prepared: false, reason: 'nothing new to fold in' }
     writeReady(dir, {

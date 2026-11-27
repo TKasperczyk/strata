@@ -5,7 +5,7 @@ import { basename, join, resolve } from 'path'
 import { parseArgs } from 'util'
 import { readArchive, readState, sessionDir } from './archive.js'
 import { compact, DeclineError, planLedger, prepare, type CompactStats, type LedgerFn, type PreparedLedger } from './compact.js'
-import { estimateTokens, loadConfig, shareChars } from './config.js'
+import { estimateTokens, loadConfig, shareChars, withEffectiveBudget } from './config.js'
 import { trimLedger } from './ledger.js'
 import { messageChars } from './mask.js'
 import { formatSessionStatus, searchArchive, sessionStatus, showArchive } from './query.js'
@@ -58,6 +58,9 @@ function readJsonInput<T>(source: string): T {
   return JSON.parse(readFileSync(source === '-' ? 0 : source, 'utf-8')) as T
 }
 
+/** Leave headroom under Claude Code's 4 MiB (4,194,304-byte) `$.process.run` stdout cap. */
+const STDOUT_TRANSPORT_MAX_BYTES = 4_000_000
+
 async function runCompact(argv: string[]): Promise<void> {
   const { values } = parseArgs({
     args: argv,
@@ -95,6 +98,7 @@ async function runCompact(argv: string[]): Promise<void> {
       ...(payload.usage ? { usage: payload.usage } : {}),
       ...(payload.preparedLedger ? { preparedLedger: payload.preparedLedger } : {}),
       ...(payload.ledgerError ? { ledgerError: payload.ledgerError } : {}),
+      ...(values.out === '-' ? { maxOutputBytes: STDOUT_TRANSPORT_MAX_BYTES } : {}),
       showCommand: SHOW_COMMAND(values.session)
     },
     config
@@ -112,6 +116,7 @@ async function runPrepare(argv: string[]): Promise<void> {
       session: { type: 'string' },
       in: { type: 'string' },
       through: { type: 'string' },
+      overhead: { type: 'string' },
       instructions: { type: 'string' },
       budget: { type: 'string' }
     }
@@ -120,8 +125,14 @@ async function runPrepare(argv: string[]): Promise<void> {
   const config = loadConfig(budgetOverride(values.budget))
   if (values.through !== undefined) {
     const through = parseIntArg('--through', values.through, 0)!
+    const overheadTokens = parseIntArg('--overhead', values.overhead, 0)
     const result = await prepare(
-      { sessionKey: values.session, through, ...(values.instructions ? { instructions: values.instructions } : {}) },
+      {
+        sessionKey: values.session,
+        through,
+        ...(overheadTokens !== undefined ? { overheadTokens } : {}),
+        ...(values.instructions ? { instructions: values.instructions } : {})
+      },
       config
     )
     process.stdout.write(`${JSON.stringify(result)}\n`)
@@ -156,6 +167,7 @@ function runLedgerPlan(argv: string[]): void {
       session: { type: 'string' },
       in: { type: 'string' },
       through: { type: 'string' },
+      overhead: { type: 'string' },
       instructions: { type: 'string' },
       budget: { type: 'string' },
       sync: { type: 'boolean' }
@@ -166,8 +178,14 @@ function runLedgerPlan(argv: string[]): void {
   const options = values.sync ? { enforceMinChars: false } : {}
   if (values.through !== undefined) {
     const through = parseIntArg('--through', values.through, 0)!
+    const overheadTokens = parseIntArg('--overhead', values.overhead, 0)
     const plan = planLedger(
-      { sessionKey: values.session, through, ...(values.instructions ? { instructions: values.instructions } : {}) },
+      {
+        sessionKey: values.session,
+        through,
+        ...(overheadTokens !== undefined ? { overheadTokens } : {}),
+        ...(values.instructions ? { instructions: values.instructions } : {})
+      },
       config,
       options
     )
@@ -203,11 +221,13 @@ function runLedgerSave(argv: string[]): void {
     options: {
       session: { type: 'string' },
       in: { type: 'string' },
+      overhead: { type: 'string' },
       budget: { type: 'string' }
     }
   })
   if (!values.session || !values.in) fail('ledger-save needs --session and --in')
-  const config = loadConfig(budgetOverride(values.budget))
+  const overheadTokens = parseIntArg('--overhead', values.overhead, 0)
+  const config = withEffectiveBudget(loadConfig(budgetOverride(values.budget)), overheadTokens)
   const dir = sessionDir(config.dataDir, values.session)
   const payload = readJsonInput<{ ledger: string; through: number; prefixHash: string; age: number }>(values.in)
   if (typeof payload.ledger !== 'string' || typeof payload.through !== 'number' || typeof payload.prefixHash !== 'string' || typeof payload.age !== 'number') {
@@ -316,7 +336,7 @@ function runStatus(argv: string[]): void {
 function summarize(s: CompactStats): string {
   const k = (chars: number) => `${Math.round(estimateTokens(chars) / 1000)}k`
   return [
-    `archived ${s.archived} (+${s.newRaw}${s.matchedPrevious ? '' : `, matched ${s.matched}`}) branch ${s.branch}`,
+    `archived ${s.archived} (+${s.newRaw}${s.matchedPrevious ? '' : s.recoveredTail ? `, recovered tail ${s.matched}` : `, matched ${s.matched}`}) branch ${s.branch}`,
     `raw ${k(s.rawChars)} -> out ${k(s.outputChars)}`,
     `header ${k(s.layers.header)} middle ${k(s.layers.middle)} tail ${k(s.layers.tail)}${s.hiddenChars ? ` (${k(s.hiddenChars)} images/thinking)` : ''}`,
     s.mediaSaved ? `${s.mediaSaved} images archived` : '',

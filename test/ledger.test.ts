@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import * as anthropicModule from '../src/anthropic.js'
 import { loadConfig, shareChars } from '../src/config.js'
-import { buildLedgerPrompt, ledgerMaxTokens, ledgerRequests, MAX_LEDGER_TOKENS, renderSpan, resolveStandaloneModel, trimLedger } from '../src/ledger.js'
+import { buildLedgerPrompt, ledgerMaxTokens, ledgerRequests, MAX_LEDGER_TOKENS, renderSpan, resolveStandaloneModel, trimLedger, updateLedger } from '../src/ledger.js'
 import type { ArchivedMessage } from '../src/types.js'
 
 describe('ledger rendering and helpers', () => {
@@ -157,5 +158,37 @@ describe('ledger rendering and helpers', () => {
     expect(ledgerMaxTokens(112_001)).toBe(64_000)
     expect(ledgerMaxTokens(shareChars(loadConfig({ budgetTokens: 534_000 }), 'ledger'))).toBe(64_000)
     expect(ledgerMaxTokens(shareChars(loadConfig({ budgetTokens: 1_000_000 }), 'ledger'))).toBe(64_000)
+  })
+
+  it('updateLedger uses streaming (messages.stream().finalMessage()) so 24k-token default budgets do not hit the SDK non-streaming cap', async () => {
+    const streamCalls: Array<{ model: string; max_tokens: number }> = []
+    const createSpy = vi.fn(() => {
+      throw new Error('must not call non-streaming messages.create')
+    })
+    const fakeClient = {
+      messages: {
+        create: createSpy,
+        stream: vi.fn((params: { model: string; max_tokens: number }) => {
+          streamCalls.push({ model: params.model, max_tokens: params.max_tokens })
+          return {
+            finalMessage: async () => ({
+              stop_reason: 'end_turn',
+              content: [{ type: 'text', text: '## Current state\n- streamed ok (#0)' }]
+            })
+          }
+        })
+      }
+    }
+    const clientSpy = vi.spyOn(anthropicModule, 'createAnthropicClient').mockResolvedValue(fakeClient as never)
+    try {
+      const cfg200k = loadConfig({ budgetTokens: 200_000 })
+      const span: ArchivedMessage[] = [{ seq: 0, role: 'user', text: 'start task', toolUses: [] }]
+      const out = await updateLedger('', span, cfg200k)
+      expect(out).toEqual({ ledger: '## Current state\n- streamed ok (#0)', requests: 1 })
+      expect(createSpy).not.toHaveBeenCalled()
+      expect(streamCalls).toEqual([{ model: 'claude-sonnet-4-6', max_tokens: 24_000 }])
+    } finally {
+      clientSpy.mockRestore()
+    }
   })
 })

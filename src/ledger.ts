@@ -245,20 +245,22 @@ export async function updateLedger(
   const maxChars = shareChars(config, 'ledger')
   let ledger = previous
   for (const chunk of chunks) {
-    const response = await client.messages.create({
-      model: resolveStandaloneModel(config.ledgerModel),
-      max_tokens: ledgerMaxTokens(maxChars),
-      system: [
-        { type: 'text', text: CLAUDE_CODE_SYSTEM_PROMPT },
-        { type: 'text', text: LEDGER_SYSTEM_PROMPT }
-      ],
-      messages: [
-        {
-          role: 'user',
-          content: buildLedgerPrompt(ledger, chunk, maxChars, focus)
-        }
-      ]
-    })
+    const response = await client.messages
+      .stream({
+        model: resolveStandaloneModel(config.ledgerModel),
+        max_tokens: ledgerMaxTokens(maxChars),
+        system: [
+          { type: 'text', text: CLAUDE_CODE_SYSTEM_PROMPT },
+          { type: 'text', text: LEDGER_SYSTEM_PROMPT }
+        ],
+        messages: [
+          {
+            role: 'user',
+            content: buildLedgerPrompt(ledger, chunk, maxChars, focus)
+          }
+        ]
+      })
+      .finalMessage()
     const text = response.content
       .filter((b): b is Extract<typeof b, { type: 'text' }> => b.type === 'text')
       .map(b => b.text)

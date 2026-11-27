@@ -2,10 +2,10 @@ import { appendFileSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFil
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { readArchive, readState } from '../src/archive.js'
-import { compact, HEADER_MARK, mediaExtension, OversizeError, planLedger, prepare, UnpreservableError, type LedgerFn } from '../src/compact.js'
+import { readArchive, readState, writeState } from '../src/archive.js'
+import { compact, DeclineError, HEADER_MARK, mediaExtension, OversizeError, planLedger, prepare, UnpreservableError, type LedgerFn } from '../src/compact.js'
 import { readReady, tryLock } from '../src/ready.js'
-import { loadConfig, type Config } from '../src/config.js'
+import { effectiveBudgetTokens, loadConfig, type Config } from '../src/config.js'
 import { renderEpisode, renderIndex, segmentEpisodes } from '../src/episodes.js'
 import { maskMessage, messageChars, STUB_PREFIX } from '../src/mask.js'
 import type { Message, OutputEntry } from '../src/types.js'
@@ -146,14 +146,16 @@ describe('compact', () => {
     expect(calls).toEqual(answered)
   })
 
-  it('keeps the newest exchange verbatim by handle, every row, in order', async () => {
-    // The interleaved exchange carries three large results: give it room to fit.
+  it('keeps an in-flight mid-turn thinking exchange verbatim by handle on assistant rows and raw-built on tool_result rows', async () => {
+    // The interleaved exchange carries three results and ends mid-turn on a tool_result.
     config = loadConfig({ dataDir: dir, budgetTokens: BUDGET_TOKENS * 3, ledgerRebuildEvery: 0 })
     const live = [...Array.from({ length: 8 }, (_, n) => turn(n)).flat(), ...interleaved(99).slice(0, 7)]
     const { entries } = await run(live)
     const kept = entries.filter((e): e is { keep: number } => 'keep' in e).map(e => e.keep)
     const exchangeStart = live.length - 6
-    expect(kept.slice(-6)).toEqual([0, 1, 2, 3, 4, 5].map(k => exchangeStart + k))
+    // Assistant rows (thinkingOnly, call x, call y, call z) stay by handle; tool_result rows (+3, +5) are emitted raw-built.
+    expect(kept.slice(-4)).toEqual([0, 1, 2, 4].map(k => exchangeStart + k))
+    expect(materialize(live, entries).slice(-6)).toEqual(live.slice(-6))
   })
 
   it('masks large results in the middle layer', async () => {
@@ -281,17 +283,20 @@ describe('second-review regressions', () => {
     expect(state.ledger).not.toContain('ABANDONED')
   })
 
-  it('N3: new rows after a rewind keep their handles even next to a rebuilt row', async () => {
+  it('N3: new mid-turn thinking rows after a rewind keep their handles even next to a rebuilt row', async () => {
     const first = [user('ask'), answer('old response'), user('P'.repeat(Math.floor(BUDGET_CHARS * 0.7)))]
     const out = materialize(first, (await run(first)).entries)
     const responseAt = out.findIndex(m => m.text.startsWith('old response'))
-    const live = [...out.slice(0, responseAt + 1), call('img', '', SMALL_RESULT), resultsOf(SMALL_RESULT, 'img')]
+    const live = [...out.slice(0, responseAt + 1), thinkingOnly(), call('img', '', SMALL_RESULT), resultsOf(SMALL_RESULT, 'img')]
     const { entries } = await run(live)
     const kept = entries.filter((e): e is { keep: number } => 'keep' in e).map(e => e.keep)
-    expect(kept).toEqual(expect.arrayContaining([live.length - 2, live.length - 1]))
+    // Assistant rows (thinkingOnly, call) keep their handles; the tool_result row is raw-built.
+    expect(kept).toEqual(expect.arrayContaining([live.length - 3, live.length - 2]))
+    expect(kept).not.toContain(live.length - 1)
+    expect(materialize(live, entries).at(-1)?.toolResults?.[0].tool_use_id).toBe('img')
   })
 
-  it('N4: the latest response stays verbatim from its thinking row on', async () => {
+  it('N4: the latest mid-turn response stays verbatim from its thinking row on', async () => {
     config = loadConfig({ dataDir: dir, budgetTokens: BUDGET_TOKENS * 3, ledgerRebuildEvery: 0 })
     // thinking → call a → result a → call b → result b, one response split by its result
     const response = [thinkingOnly(), call('a', '', SMALL_RESULT), resultsOf(SMALL_RESULT, 'a'), call('b', '', SMALL_RESULT), resultsOf(SMALL_RESULT, 'b')]
@@ -299,7 +304,10 @@ describe('second-review regressions', () => {
     const { entries } = await run(live)
     const kept = entries.filter((e): e is { keep: number } => 'keep' in e).map(e => e.keep)
     const from = live.length - response.length
-    expect(kept).toEqual(expect.arrayContaining(response.map((_, k) => from + k)))
+    expect(kept).toEqual(expect.arrayContaining([from, from + 1, from + 3]))
+    expect(kept).not.toContain(from + 2)
+    expect(kept).not.toContain(from + 4)
+    expect(materialize(live, entries).slice(-response.length)).toEqual(response)
   })
 })
 
@@ -314,17 +322,21 @@ describe('third-review regressions', () => {
     expect(stats.newRaw).toBe(2)
   })
 
-  it('N3: rows the engine holds whole stay whole on later compactions too', async () => {
+  it('N3: kept prompts and in-flight thinking rows stay whole on later compactions too', async () => {
     const first = [user('ask'), answer('old response'), user('P'.repeat(Math.floor(BUDGET_CHARS * 0.7)))]
     const out = materialize(first, (await run(first)).entries)
     const responseAt = out.findIndex(m => m.text.startsWith('old response'))
-    let live = [...out.slice(0, responseAt + 1), call('img', '', SMALL_RESULT), resultsOf(SMALL_RESULT, 'img')]
+    let live = [...out.slice(0, responseAt + 1), user('follow up with image'), thinkingOnly(), call('img', '', SMALL_RESULT), resultsOf(SMALL_RESULT, 'img')]
     live = materialize(live, (await run(live)).entries)
-    const imageRows = [live.length - 2, live.length - 1]
-    live.push(answer('done'))
+    const promptAt = live.findIndex(m => m.text === 'follow up with image')
+    const thinkingAt = promptAt + 1
+    const callAt = promptAt + 2
+    // Still mid-turn after adding another call/result in the same response: prompt + assistant handles remain kept.
+    live.push(call('img2', '', SMALL_RESULT), resultsOf(SMALL_RESULT, 'img2'))
     const { entries } = await run(live)
     const kept = entries.filter((e): e is { keep: number } => 'keep' in e).map(e => e.keep)
-    expect(kept).toEqual(expect.arrayContaining(imageRows))
+    expect(kept).toEqual(expect.arrayContaining([promptAt, thinkingAt, callAt, live.length - 2]))
+    expect(kept).not.toContain(live.length - 1)
   })
 
   it('N4: declines when the latest response\'s thinking was already rebuilt', async () => {
@@ -571,18 +583,36 @@ describe('v0.3 improvements and edge cases', () => {
 
   it('prepare accounts for hidden weights (api) and supports explicit through catch-up', async () => {
     config = loadConfig({ dataDir: dir, budgetTokens: BUDGET_TOKENS, ledgerRebuildEvery: 0, prepareMinChars: 1 })
-    const sig = 's'.repeat(8_000)
-    const rows = Array.from({ length: 24 }, (_, n) => [user(`p${n}`), thinkingOnly(), call(`c${n}`, '', 'ok'), resultsOf('ok', `c${n}`), answer(`a${n}`)]).flat()
-    const api: ApiMessage[] = Array.from({ length: 24 }, (_, n) => [
-      { role: 'user' as const, content: [{ type: 'text', text: `p${n}` }] },
-      { role: 'assistant' as const, content: [{ type: 'thinking', thinking: '', signature: sig }, { type: 'tool_use', id: `c${n}`, name: 'Read', input: {} }] },
-      { role: 'user' as const, content: [{ type: 'tool_result', tool_use_id: `c${n}`, content: 'ok' }] },
-      { role: 'assistant' as const, content: [{ type: 'text', text: `a${n} ${ANSWER_DETAIL}` }] }
-    ]).flat()
-    // Without api, rows are tiny (~5k chars) -> nothing evicted!
+    const png1200 = (() => {
+      const head = Buffer.alloc(33)
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(head, 0)
+      head.writeUInt32BE(13, 8)
+      head.write('IHDR', 12, 'ascii')
+      head.writeUInt32BE(1200, 16)
+      head.writeUInt32BE(1200, 20)
+      return head.toString('base64')
+    })()
+    const rows = [
+      ...Array.from({ length: 8 }, (_, n) => [user(`p${n}`), answer(`a${n} ${'x'.repeat(1_000)}`)]).flat(),
+      user('final pasted screenshot')
+    ]
+    const api: ApiMessage[] = [
+      ...Array.from({ length: 8 }, (_, n) => [
+        { role: 'user' as const, content: [{ type: 'text', text: `p${n}` }] },
+        { role: 'assistant' as const, content: [{ type: 'text', text: `a${n} ${'x'.repeat(1_000)} ${ANSWER_DETAIL}` }] }
+      ]).flat(),
+      {
+        role: 'user' as const,
+        content: [
+          { type: 'text', text: 'final pasted screenshot' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: png1200 } }
+        ]
+      }
+    ]
+    // Without api, rows fit in the 14k-char budget (~11.5k chars) -> nothing evicted!
     const textOnly = await prepare({ sessionKey: SESSION, messages: rows, showCommand: SHOW }, config, fakeLedger)
     expect(textOnly.prepared).toBe(false)
-    // With api, thinking weighs ~32k tokens -> prepare evicts and folds into ready ledger!
+    // With api, the final kept prompt carries a 1,600-token pasted image (~5.6k chars) -> prepare evicts and folds into ready ledger!
     const weighted = await prepare({ sessionKey: SESSION, messages: rows, api, showCommand: SHOW }, config, fakeLedger)
     expect(weighted.prepared).toBe(true)
 
@@ -700,7 +730,8 @@ describe('v0.3 improvements and edge cases', () => {
   })
 
   it('rejects a foreign wrong-role or non-strata-header prefix even when a generic tail matches', async () => {
-    const live = Array.from({ length: 12 }, (_, n) => turn(n)).flat()
+    config = loadConfig({ dataDir: dir, budgetTokens: BUDGET_TOKENS * 2, ledgerRebuildEvery: 0 })
+    const live = Array.from({ length: 14 }, (_, n) => turn(n)).flat()
     const first = await run(live)
     const out = materialize(live, first.entries)
     const firstKeep = first.entries.findIndex(e => 'keep' in e)
@@ -744,5 +775,201 @@ describe('v0.3 improvements and edge cases', () => {
     expect(denseRun.stats.outputChars).toBeLessThanOrEqual(BUDGET_CHARS)
     const rawOutChars = chars(materialize(denseTurns, denseRun.entries))
     expect(rawOutChars).toBeLessThan(chars(materialize(denseTurns, defaultRun.entries)))
+  })
+})
+
+describe('v0.3.4 resume continuity, overhead budget, and original-request fixes', () => {
+  it('emits completed tail exchanges as raw built turns (never keeping assistant or tool_result handles) while preserving multi-compaction continuity', async () => {
+    config = loadConfig({ dataDir: dir, budgetTokens: BUDGET_TOKENS * 2, ledgerRebuildEvery: 0 })
+    const live = Array.from({ length: 10 }, (_, n) => turn(n)).flat()
+    const first = await run(live)
+    for (const entry of first.entries) {
+      if ('keep' in entry) {
+        const keptMsg = live[entry.keep]
+        expect(keptMsg.role).toBe('user')
+        expect(keptMsg.toolResults?.length ?? 0).toBe(0)
+      }
+    }
+    const out = materialize(live, first.entries)
+    assertPaired(out)
+    // Verbatim tail keeps full unmasked tool result from the newest turn.
+    expect(out.some(m => (m.toolResults ?? []).some(r => r.text === BIG_RESULT))).toBe(true)
+
+    // Second compaction recognizes 100% of first output and archives only the new turn.
+    const second = await run([...out, ...turn(50)])
+    expect(second.stats.matchedPrevious).toBe(true)
+    expect(second.stats.newRaw).toBe(4)
+    expect(second.stats.archived).toBe(live.length + 4)
+  })
+
+  it('recovers branch continuity from a truncated legacy --resume tail with tool_use_id provenance and rejects text-only or non-suffix matches', async () => {
+    const live = Array.from({ length: 12 }, (_, n) => turn(n)).flat()
+    const first = await run(live)
+    const out = materialize(live, first.entries)
+    const sdir = join(dir, 'sessions', SESSION)
+    const stateBefore = readState(sdir)
+    // Simulate a legacy v0.3.3 state where the trailing 4 rows were kept (seq >= 0).
+    const legacyLastOutput = stateBefore.lastOutput.map((rec, i) =>
+      i >= stateBefore.lastOutput.length - 4 ? { ...rec, seq: live.length - (stateBefore.lastOutput.length - i) } : rec
+    )
+    writeState(sdir, { ...stateBefore, lastOutput: legacyLastOutput })
+    const tailOnly = out.slice(-4)
+
+    // Truncated legacy tail containing unique tool_use_id provenance recovers the whole branch.
+    const recovered = await run([...tailOnly, ...turn(60)])
+    expect(recovered.stats.recoveredTail).toBe(true)
+    expect(recovered.stats.branch).toBe(live.length + 4)
+    expect(recovered.stats.newRaw).toBe(4)
+    expect(readState(sdir).ledger).toContain('covered through')
+
+    // Negative case 1: a prefix/middle slice (does not reach end of lastOutput) must not match.
+    writeState(sdir, { ...stateBefore, lastOutput: legacyLastOutput })
+    const nonSuffix = await run([...out.slice(-4, -1), ...turn(62)])
+    expect(nonSuffix.stats.recoveredTail).toBeUndefined()
+    expect(nonSuffix.stats.matched).toBe(0)
+
+    // Negative case 2: a replacement conversation starting with the SAME long prompt + reply (no tool_use_id) must NOT resurrect the old branch!
+    const textFirst = [
+      user('early architecture discussion that must stay abandoned'),
+      answer('old answer'),
+      user('Please carefully review the production migration checklist before shipping'),
+      answer('Looks ready to deploy.')
+    ]
+    await compact({ sessionKey: 'text-only-tail', messages: textFirst, showCommand: 'strata show text-only-tail' }, config, fakeLedger)
+    const textDir = join(dir, 'sessions', 'text-only-tail')
+    const textState = readState(textDir)
+    writeState(textDir, {
+      ...textState,
+      lastOutput: textState.lastOutput.map((r, i) => (i >= textState.lastOutput.length - 2 ? { ...r, seq: i } : r))
+    })
+    const textCheck = await compact(
+      {
+        sessionKey: 'text-only-tail',
+        messages: [
+          user('Please carefully review the production migration checklist before shipping'),
+          answer('Looks ready to deploy.'),
+          user('brand new follow-up')
+        ],
+        showCommand: 'strata show text-only-tail'
+      },
+      config,
+      fakeLedger
+    )
+    expect(textCheck.stats.recoveredTail).toBeUndefined()
+    expect(textCheck.stats.branch).toBe(3)
+  })
+
+  it('skips synthetic command, bash-input, and notification prompts when pinning Original request, while keeping slash commands with arguments', async () => {
+    const live = [
+      user('<command-name>/reload-plugins</command-name>\n<command-message>reload-plugins</command-message>'),
+      user('<local-command-stdout>Reloaded 3 plugins</local-command-stdout>'),
+      user('<bash-input>git status</bash-input>'),
+      user('<task-notification>background task finished</task-notification>'),
+      user('Build the real telemetry dashboard for varde'),
+      ...Array.from({ length: 10 }, (_, n) => turn(n)).flat()
+    ]
+    const res = await run(live)
+    const header = materialize(live, res.entries)[0].text
+    const originalSection = header.split('## Session ledger')[0]
+    expect(originalSection).toContain('## Original request (seq 4)')
+    expect(originalSection).toContain('Build the real telemetry dashboard for varde')
+    expect(originalSection).not.toContain('/reload-plugins')
+    expect(originalSection).not.toContain('<bash-input>')
+
+    // A slash command with non-empty <command-args> is a real user request and should be pinned.
+    const withArgs = [
+      user('<command-name>/reload-plugins</command-name>'),
+      user('<command-name>/review</command-name>\n<command-args>audit auth middleware for race conditions</command-args>'),
+      ...Array.from({ length: 10 }, (_, n) => turn(n)).flat()
+    ]
+    const argRes = await compact({ sessionKey: 'cmd-args', messages: withArgs, showCommand: 'strata show cmd-args' }, config, fakeLedger)
+    const argSection = materialize(withArgs, argRes.entries)[0].text.split('## Session ledger')[0]
+    expect(argSection).toContain('## Original request (seq 1)')
+    expect(argSection).toContain('audit auth middleware for race conditions')
+  })
+
+  it('does not pull an abandoned tool_result into branch when rewinding mid-way through a raw-built exchange', async () => {
+    config = loadConfig({ dataDir: dir, budgetTokens: BUDGET_TOKENS * 2, ledgerRebuildEvery: 0 })
+    const initial = [user('check file'), call('x1', 'reading', SMALL_RESULT), resultsOf('ORIGINAL_RESULT', 'x1'), answer('done')]
+    const first = await run(initial)
+    const out = materialize(initial, first.entries)
+    // Rewind to keep [prompt, call x1] and replace the tool_result with a different result.
+    const rewound = [out[0], out[1], resultsOf('CHANGED_RESULT', 'x1')]
+    const second = await run(rewound)
+    const out2 = materialize(rewound, second.entries)
+    const x1Results = out2.flatMap(m => m.toolResults ?? []).filter(r => r.tool_use_id === 'x1')
+    expect(x1Results).toHaveLength(1)
+    expect(x1Results[0].text).toBe('CHANGED_RESULT')
+  })
+
+  it('protects multi-step in-flight thinking from the first thinking row, detects API-form thinking on call rows, and survives mid-loop task-notifications', async () => {
+    config = loadConfig({ dataDir: dir, budgetTokens: BUDGET_TOKENS * 3, ledgerRebuildEvery: 0 })
+    // Multi-step thinking turn + mid-loop <task-notification> wrapper at the end.
+    const response = [
+      thinkingOnly(),
+      call('a', '', SMALL_RESULT),
+      resultsOf(SMALL_RESULT, 'a'),
+      thinkingOnly(),
+      call('b', '', SMALL_RESULT),
+      resultsOf(SMALL_RESULT, 'b'),
+      user('<task-notification>background task finished</task-notification>')
+    ]
+    const live = [...Array.from({ length: 8 }, (_, n) => turn(n)).flat(), user('start task'), ...response]
+    const { entries } = await run(live)
+    const kept = entries.filter((e): e is { keep: number } => 'keep' in e).map(e => e.keep)
+    const from = live.length - response.length
+    // Must protect from the FIRST thinking row (from), keeping all assistant rows (from, from+1, from+3, from+4) and rebuilding results.
+    expect(kept).toEqual(expect.arrayContaining([from, from + 1, from + 3, from + 4]))
+    expect(kept).not.toContain(from + 2)
+    expect(kept).not.toContain(from + 5)
+
+    // Combined thinking + tool_use on a single row (detected via API form, no bare thinkingOnly row):
+    const combinedLive = [user('inspect'), call('c1', 'checking', SMALL_RESULT), resultsOf(SMALL_RESULT, 'c1')]
+    const combinedApi: ApiMessage[] = [
+      { role: 'user', content: [{ type: 'text', text: 'inspect' }] },
+      { role: 'assistant', content: [{ type: 'thinking', thinking: '', signature: 's'.repeat(2_000) }, { type: 'text', text: 'checking' }, { type: 'tool_use', id: 'c1', name: 'Read', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'c1', content: SMALL_RESULT }] }
+    ]
+    const combined = await compact({ sessionKey: 'combined-think', messages: combinedLive, api: combinedApi, showCommand: 'strata show combined-think' }, config, fakeLedger)
+    const combinedKept = combined.entries.filter((e): e is { keep: number } => 'keep' in e).map(e => e.keep)
+    expect(combinedKept).toEqual([0, 1])
+  })
+
+  it('declines cleanly before committing when output has 0 entries or exceeds maxOutputBytes', async () => {
+    // Isolated orphan tool_result yields 0 rebuilt entries -> DeclineError, nothing committed.
+    await expect(run([resultsOf('orphan', 'missing-call')])).rejects.toBeInstanceOf(DeclineError)
+    expect(readArchive(join(dir, 'sessions', SESSION))).toHaveLength(0)
+
+    // Output exceeding maxOutputBytes declines with OversizeError before committing state/archive.
+    const valid = [user('hello'), answer('world')]
+    await expect(
+      compact({ sessionKey: SESSION, messages: valid, showCommand: SHOW, maxOutputBytes: 50 }, config, fakeLedger)
+    ).rejects.toBeInstanceOf(OversizeError)
+    expect(readArchive(join(dir, 'sessions', SESSION))).toHaveLength(0)
+    expect(readState(join(dir, 'sessions', SESSION)).compactions).toBe(0)
+  })
+
+  it('subtracts reported static overhead from budgetTokens (with 25% floor) consistently in compact, planLedger, and --through catch-up', async () => {
+    const cfg200k = loadConfig({ budgetTokens: 200_000 })
+    expect(effectiveBudgetTokens(cfg200k, undefined)).toBe(200_000)
+    expect(effectiveBudgetTokens(cfg200k, 0)).toBe(200_000)
+    expect(effectiveBudgetTokens(cfg200k, 65_000)).toBe(135_000)
+    // Extreme overhead floors at 25% of budgetTokens (50k) rather than collapsing to 0.
+    expect(effectiveBudgetTokens(cfg200k, 190_000)).toBe(50_000)
+    expect(effectiveBudgetTokens(cfg200k, 500_000)).toBe(50_000)
+
+    // End-to-end: with 4,000 budget and 2,000 overhead, effective message budget is 2,000 tokens (7,000 chars).
+    const live = Array.from({ length: 10 }, (_, n) => [user(`step ${n}`), answer(`done ${n}`)].flat()).flat()
+    const usage = { overhead: 2_000 }
+    const plan = planLedger({ sessionKey: SESSION, messages: live, usage, showCommand: SHOW }, config, { enforceMinChars: false })
+    const compacted = await compact({ sessionKey: SESSION, messages: live, usage, showCommand: SHOW, ledgerMode: 'ready' }, config, fakeLedger)
+    expect(compacted.stats.outputChars).toBeLessThanOrEqual(2_000 * 3.5)
+    if (plan.needed) {
+      expect(plan.through).toBe(compacted.stats.cut)
+      // Explicit --through catch-up with overheadTokens computes the exact same effective maxChars.
+      const catchUpPlan = planLedger({ sessionKey: SESSION, through: compacted.stats.cut, overheadTokens: 2_000 }, config)
+      expect(catchUpPlan.needed).toBe(true)
+      if (catchUpPlan.needed) expect(catchUpPlan.maxChars).toBe(plan.maxChars)
+    }
   })
 })

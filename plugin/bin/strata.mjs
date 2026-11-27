@@ -178,6 +178,44 @@ function matchedPrefix(input, state) {
   }
   return p;
 }
+var MIN_TAIL_RECOVERY_RECORDS = 2;
+function hasToolIdentity(m) {
+  return m.toolUses.length > 0 || (m.toolResults?.length ?? 0) > 0;
+}
+function matchedResumedTail(input, state) {
+  const out = state.lastOutput;
+  if (out.length < MIN_TAIL_RECOVERY_RECORDS || input.length < MIN_TAIL_RECOVERY_RECORDS) return void 0;
+  const inputFps = /* @__PURE__ */ new Map();
+  const fpOf = (i) => {
+    let fp = inputFps.get(i);
+    if (fp === void 0) {
+      fp = fingerprint(input[i]);
+      inputFps.set(i, fp);
+    }
+    return fp;
+  };
+  const minOutStart = Math.max(1, out.length - input.length);
+  for (let outputStart = minOutStart; outputStart <= out.length - MIN_TAIL_RECOVERY_RECORDS; outputStart++) {
+    const count = out.length - outputStart;
+    let ok = true;
+    let keptCount = 0;
+    let hasToolId = false;
+    for (let k = 0; k < count; k++) {
+      const msg = input[k];
+      const rec = out[outputStart + k];
+      if (fpOf(k) !== rec.fp) {
+        ok = false;
+        break;
+      }
+      if (rec.seq >= 0) keptCount++;
+      if (hasToolIdentity(msg)) hasToolId = true;
+    }
+    if (ok && keptCount >= 1 && hasToolId) {
+      return { inputStart: 0, outputStart, count };
+    }
+  }
+  return void 0;
+}
 
 // src/compact.ts
 import { mkdirSync as mkdirSync3, writeFileSync as writeFileSync3 } from "fs";
@@ -215,6 +253,21 @@ function loadConfig(overrides = {}) {
 var CHARS_PER_TOKEN = 3.5;
 function estimateTokens(chars) {
   return Math.ceil(chars / CHARS_PER_TOKEN);
+}
+var MIN_MESSAGE_BUDGET_SHARE = 0.25;
+function effectiveBudgetTokens(config, overheadTokens) {
+  if (overheadTokens === void 0 || !Number.isFinite(overheadTokens) || overheadTokens <= 0) {
+    return config.budgetTokens;
+  }
+  const floor = Math.max(1, Math.round(config.budgetTokens * MIN_MESSAGE_BUDGET_SHARE));
+  return Math.max(floor, config.budgetTokens - Math.round(overheadTokens));
+}
+function withEffectiveBudget(config, overheadTokens) {
+  const effectiveTokens = effectiveBudgetTokens(config, overheadTokens);
+  if (effectiveTokens === config.budgetTokens) return config;
+  const defaultMin = Math.round(config.budgetTokens * CHARS_PER_TOKEN * PREPARE_MIN_SHARE);
+  const prepareMinChars = config.prepareMinChars === defaultMin ? Math.round(effectiveTokens * CHARS_PER_TOKEN * PREPARE_MIN_SHARE) : config.prepareMinChars;
+  return { ...config, budgetTokens: effectiveTokens, prepareMinChars };
 }
 function budgetChars(config) {
   return config.budgetTokens * CHARS_PER_TOKEN;
@@ -6649,7 +6702,7 @@ async function updateLedger(previous, span, config, focus) {
   const maxChars = shareChars(config, "ledger");
   let ledger = previous;
   for (const chunk of chunks) {
-    const response = await client.messages.create({
+    const response = await client.messages.stream({
       model: resolveStandaloneModel(config.ledgerModel),
       max_tokens: ledgerMaxTokens(maxChars),
       system: [
@@ -6662,7 +6715,7 @@ async function updateLedger(previous, span, config, focus) {
           content: buildLedgerPrompt(ledger, chunk, maxChars, focus)
         }
       ]
-    });
+    }).finalMessage();
     const text = response.content.filter((b) => b.type === "text").map((b) => b.text).join("").trim();
     if (!text) throw new Error(`ledger model returned no text (stop_reason ${response.stop_reason})`);
     ledger = trimLedger(text, maxChars);
@@ -6800,6 +6853,18 @@ ${mediaNote(paths)}` } : r;
 function isPrompt2(m) {
   return m.role === "user" && !m.toolResults?.length;
 }
+function isToolResultRow(m) {
+  return m.role === "user" && Boolean(m.toolResults?.length);
+}
+function rebuildToolResultRow(row) {
+  const m = withMedia(row, row);
+  return {
+    role: "user",
+    text: m.text,
+    toolUses: [],
+    toolResults: m.toolResults ?? []
+  };
+}
 function segmentUnits(rows, whole = []) {
   const units = [];
   let i = 0;
@@ -6847,7 +6912,7 @@ function rebuildUnit(rows, mode, config) {
   }
   const answered = new Set(results.map((r) => r.tool_use_id));
   const called = new Set(uses.map((u) => u.tool_use_id));
-  const pairedUses = uses.filter((u) => answered.has(u.tool_use_id));
+  const pairedUses = uses.filter((u) => answered.has(u.tool_use_id)).map((u) => ({ tool_use_id: u.tool_use_id, tool: u.tool, input: u.input }));
   const pairedResults = results.filter((r) => called.has(r.tool_use_id));
   const out = [];
   if (texts.length || pairedUses.length) out.push({ role: "assistant", text: texts.join("\n"), toolUses: pairedUses });
@@ -7169,15 +7234,40 @@ function mediaExtension(mediaType) {
 function isPrompt3(m) {
   return m.role === "user" && m.text.trim() !== "" && !m.toolResults?.length;
 }
+var NON_TURN_WRAPPER_RE = /^(?:<(?:local-command-[a-z-]+|task-notification|system-reminder|teammate-message|bash-notification|scheduled-task|user-prompt-submit-hook|agent-notification)\b|\[(?:Request interrupted|Orphaned tool result))/i;
+var COMMAND_WRAPPER_RE = /^<(?:command-name|command-message|command-args|bash-input)\b/i;
+var NON_EMPTY_COMMAND_ARGS_RE = /<command-args>\s*\S[\s\S]*?<\/command-args>/i;
+function isTurnPrompt(m) {
+  return isPrompt3(m) && !NON_TURN_WRAPPER_RE.test(m.text.trimStart());
+}
+function isOriginalRequest(m) {
+  if (!isTurnPrompt(m)) return false;
+  const trimmed = m.text.trimStart();
+  if (COMMAND_WRAPPER_RE.test(trimmed)) return NON_EMPTY_COMMAND_ARGS_RE.test(trimmed);
+  return true;
+}
 function reconcile(dir, input, state) {
   const archive = readArchive(dir);
-  const matched = matchedPrefix(input, state);
-  const base = matched > 0 ? state.branch.slice(0, state.lastOutput[matched - 1].upto) : [];
-  const inputBySeq = /* @__PURE__ */ new Map();
-  for (let i = 0; i < matched; i++) {
-    if (state.lastOutput[i].seq >= 0) inputBySeq.set(state.lastOutput[i].seq, i);
+  let matched = matchedPrefix(input, state);
+  if (matched > 0 && matched < state.lastOutput.length && state.lastOutput[matched - 1].upto === state.lastOutput[matched].upto) {
+    const partialUpto = state.lastOutput[matched - 1].upto;
+    while (matched > 0 && state.lastOutput[matched - 1].upto === partialUpto) matched--;
   }
-  const fresh = input.map((_, i) => i).slice(matched).filter((i) => !input[i].text.startsWith(HEADER_MARK));
+  const resumed = matched === 0 ? matchedResumedTail(input, state) : void 0;
+  const base = matched > 0 ? state.branch.slice(0, state.lastOutput[matched - 1].upto) : resumed ? state.branch.slice(0, state.lastOutput[state.lastOutput.length - 1].upto) : [];
+  const inputBySeq = /* @__PURE__ */ new Map();
+  if (matched > 0) {
+    for (let i = 0; i < matched; i++) {
+      if (state.lastOutput[i].seq >= 0) inputBySeq.set(state.lastOutput[i].seq, i);
+    }
+  } else if (resumed) {
+    for (let k = 0; k < resumed.count; k++) {
+      const rec = state.lastOutput[resumed.outputStart + k];
+      if (rec.seq >= 0) inputBySeq.set(rec.seq, resumed.inputStart + k);
+    }
+  }
+  const freshStart = resumed ? resumed.inputStart + resumed.count : matched;
+  const fresh = input.map((_, i) => i).slice(freshStart).filter((i) => !input[i].text.startsWith(HEADER_MARK));
   const nextSeq = archive.reduce((max, m) => Math.max(max, m.seq + 1), archive.length);
   const pending = numberMessages(nextSeq, fresh.map((i) => input[i]));
   fresh.forEach((inputIndex, k) => inputBySeq.set(pending[k].seq, inputIndex));
@@ -7190,7 +7280,8 @@ function reconcile(dir, input, state) {
     pending,
     branch,
     inputBySeq,
-    matched,
+    matched: resumed ? resumed.count : matched,
+    recoveredTail: Boolean(resumed),
     ledgerStale: base.length < state.ledgerThrough
   };
 }
@@ -7199,7 +7290,7 @@ function headerPreamble(input, dir) {
   return `${HEADER_MARK} Older turns of this session were moved out of context. Every message's text is archived in ${archivePath(dir)} (one JSON message per line; line N+1 is seq N), and its images as files under ${join5(dir, "media")}. ${access} "[strata elided \u2026]" markers in the turns below point to archived tool results; read the archive or re-run the tool when you need the exact text. Never treat the index or ledger as proof that work happened: verify against files, git, or the archive before relying on it.`;
 }
 function buildHeader(input, dir, evicted, ledger, ledgerThrough, config) {
-  const pinned = evicted.find(isPrompt3);
+  const pinned = evicted.find(isOriginalRequest) ?? evicted.find(isPrompt3);
   const sections = [headerPreamble(input, dir)];
   if (pinned) sections.push(`## Original request (seq ${pinned.seq})
 ${safeSlicePrefix(pinned.text, shareChars(config, "pinned"))}`);
@@ -7280,21 +7371,48 @@ function layout(verbatim, masked, protectedFrom, headerAt, budget, config) {
   }
   return { cut: cut2, tail };
 }
-function protectedUnit(rows, units) {
+function isThinkingOnlyRow(m) {
+  return m.role === "assistant" && !m.text.trim() && m.toolUses.length === 0;
+}
+function unitHasOpenCall(rows, u) {
+  const open = /* @__PURE__ */ new Set();
+  for (let i = u.start; i < u.end; i++) {
+    for (const c of rows[i].toolUses) open.add(c.tool_use_id);
+    for (const r of rows[i].toolResults ?? []) open.delete(r.tool_use_id);
+  }
+  return open.size > 0;
+}
+function protectedUnit(rows, units, hidden, inputBySeq) {
   let lastPrompt = -1;
   rows.forEach((m, i) => {
-    if (isPrompt2(m)) lastPrompt = i;
+    if (isTurnPrompt(m)) lastPrompt = i;
   });
+  const tail = rows.slice(lastPrompt + 1);
+  if (tail.length === 0) return { from: units.length - 1, thinking: false, midTurn: false };
+  const open = /* @__PURE__ */ new Set();
+  for (const m of tail) {
+    for (const u of m.toolUses) open.add(u.tool_use_id);
+    for (const r of m.toolResults ?? []) open.delete(r.tool_use_id);
+  }
+  const lastNonWrapper = [...tail].reverse().find((m) => !(isPrompt2(m) && !isTurnPrompt(m)));
+  if (!lastNonWrapper) return { from: units.length - 1, thinking: false, midTurn: false };
+  const midTurn = open.size > 0 || isToolResultRow(lastNonWrapper) || isThinkingOnlyRow(lastNonWrapper);
+  if (!midTurn) return { from: units.length - 1, thinking: false, midTurn: false };
+  const hasThinking = (rowIndex) => {
+    const m = rows[rowIndex];
+    if (isThinkingOnlyRow(m)) return true;
+    const inputIdx = inputBySeq.get(m.seq);
+    return inputIdx !== void 0 && (hidden.get(inputIdx)?.thinkingChars ?? 0) > 0;
+  };
   let thinking = -1;
-  for (let i = rows.length - 1; i > lastPrompt; i--) {
-    const m = rows[i];
-    if (m.role === "assistant" && !m.text.trim() && m.toolUses.length === 0) {
+  for (let i = lastPrompt + 1; i < rows.length; i++) {
+    if (hasThinking(i)) {
       thinking = i;
       break;
     }
   }
-  if (thinking < 0) return { from: units.length - 1, thinking: false };
-  return { from: units.findIndex((u) => u.start <= thinking && thinking < u.end), thinking: true };
+  if (thinking < 0) return { from: units.length - 1, thinking: false, midTurn: true };
+  return { from: units.findIndex((u) => u.start <= thinking && thinking < u.end), thinking: true, midTurn: true };
 }
 function bestLedger(dir, state, rows, ledgerStale) {
   const committed = ledgerStale ? { ledger: "", ledgerThrough: 0, ledgerAge: 0, requests: 0 } : { ledger: state.ledger, ledgerThrough: state.ledgerThrough, ledgerAge: state.ledgerAge, requests: 0 };
@@ -7382,7 +7500,8 @@ async function advanceLedger(base, rows, cutRow, config, ledgerFn, focus) {
   }
 }
 function planCompaction(input, config, reserveFullLedger) {
-  const dir = sessionDir(config.dataDir, input.sessionKey);
+  const effectiveConfig = withEffectiveBudget(config, input.usage?.overhead);
+  const dir = sessionDir(effectiveConfig.dataDir, input.sessionKey);
   const state = readState(dir);
   const reconciled = reconcile(dir, input.messages, state);
   const { bySeq, branch, inputBySeq, pending, ledgerStale } = reconciled;
@@ -7401,23 +7520,33 @@ function planCompaction(input, config, reserveFullLedger) {
     });
   }
   const rows = branch.map((seq) => bySeq.get(seq));
-  const units = segmentUnits(rows, rows.map((m) => inputBySeq.has(m.seq)));
+  const rowWhole = [];
+  for (let i = 0; i < rows.length; i++) {
+    const m = rows[i];
+    rowWhole.push(isToolResultRow(m) ? i > 0 && rowWhole[i - 1] : inputBySeq.has(m.seq));
+  }
+  const units = segmentUnits(rows, rowWhole);
   if (units.length === 0) throw new Error("nothing to compact");
-  const handles = units.map((u) => rows.slice(u.start, u.end).map((m) => inputBySeq.get(m.seq)));
-  const whole = handles.map((h) => h.every((i) => i !== void 0));
-  const guard = protectedUnit(rows, units);
-  if (guard.thinking && whole.slice(guard.from).some((w) => !w)) {
+  const handles = units.map((u) => rows.slice(u.start, u.end).map((m) => isToolResultRow(m) ? void 0 : inputBySeq.get(m.seq)));
+  const engineWhole = units.map((u, k) => rows.slice(u.start, u.end).every((m, j) => isToolResultRow(m) || handles[k][j] !== void 0));
+  const guard = protectedUnit(rows, units, hidden, inputBySeq);
+  if (guard.thinking && engineWhole.slice(guard.from).some((w) => !w)) {
     throw new UnpreservableError("the latest response opens with thinking that only the engine still holds, and part of it was already rebuilt");
   }
-  const rawBuilt = units.map((u) => rebuildUnit(rows.slice(u.start, u.end), "raw", config));
-  const maskedBuilt = units.map((u) => rebuildUnit(rows.slice(u.start, u.end), "masked", config));
+  const whole = units.map((u, k) => {
+    if (!engineWhole[k]) return false;
+    if (u.kind === "prompt") return true;
+    return guard.midTurn && k >= guard.from && (guard.thinking || unitHasOpenCall(rows, u));
+  });
+  const rawBuilt = units.map((u) => rebuildUnit(rows.slice(u.start, u.end), "raw", effectiveConfig));
+  const maskedBuilt = units.map((u) => rebuildUnit(rows.slice(u.start, u.end), "masked", effectiveConfig));
   const scaledMessagesChars = (msgs) => msgs.reduce((n, m) => n + calibratedTextChars(messageChars(m), charsPerToken), 0);
   const maskedSizes = maskedBuilt.map(scaledMessagesChars);
-  const rowChars = (m) => calibratedTextChars(messageChars(m), charsPerToken) + hiddenChars(hidden.get(inputBySeq.get(m.seq)), ratio);
+  const rowChars = (m) => isToolResultRow(m) ? calibratedTextChars(messageChars(rebuildToolResultRow(m)), charsPerToken) : calibratedTextChars(messageChars(m), charsPerToken) + hiddenChars(hidden.get(inputBySeq.get(m.seq)), ratio);
   const verbatim = units.map((u, k) => whole[k] ? rows.slice(u.start, u.end).reduce((n, m) => n + rowChars(m), 0) : scaledMessagesChars(rawBuilt[k]));
   const base = bestLedger(dir, state, rows, ledgerStale);
-  const budget = budgetChars(config);
-  const ledgerCap = shareChars(config, "ledger");
+  const budget = budgetChars(effectiveConfig);
+  const ledgerCap = shareChars(effectiveConfig, "ledger");
   const provided = input.preparedLedger;
   const adoptedLedger = provided && provided.through <= rows.length && prefixHash(rows, provided.through) === provided.prefixHash ? {
     ledger: trimLedger(provided.ledger, ledgerCap),
@@ -7433,14 +7562,14 @@ function planCompaction(input, config, reserveFullLedger) {
     const cache = /* @__PURE__ */ new Map();
     const placeholder = ledgerChars > 0 ? "x" : "";
     const ledgerExtra = ledgerChars > 0 ? ledgerChars - 1 : 0;
-    const indexCap = shareChars(config, "index");
+    const indexCap = shareChars(effectiveConfig, "index");
     return (cut2) => {
       if (cut2 <= 0) return 0;
       const hit = cache.get(cut2);
       if (hit !== void 0) return hit;
       const evicted = rows.slice(0, units[cut2].start);
       if (!fullReserve) {
-        const size2 = buildHeader(input, dir, evicted, placeholder, knownLedger.ledgerThrough, config).length + ledgerExtra;
+        const size2 = buildHeader(input, dir, evicted, placeholder, knownLedger.ledgerThrough, effectiveConfig).length + ledgerExtra;
         cache.set(cut2, size2);
         return size2;
       }
@@ -7449,9 +7578,9 @@ function planCompaction(input, config, reserveFullLedger) {
       const baseProtect = base.ledgerThrough < evicted.length ? evicted[base.ledgerThrough]?.seq : void 0;
       const baseIdxLen = renderIndex(episodes, indexCap, { protectAfterSeq: baseProtect }).length;
       const indexSlack = fullIdxLen > indexCap ? Math.max(0, indexCap - baseIdxLen) : 0;
-      let size = buildHeader(input, dir, evicted, placeholder, base.ledgerThrough, config).length + ledgerExtra + indexSlack;
+      let size = buildHeader(input, dir, evicted, placeholder, base.ledgerThrough, effectiveConfig).length + ledgerExtra + indexSlack;
       if (placeholder && base.ledgerThrough < evicted.length && evicted.length > 1) {
-        const maxLagHeader = buildHeader(input, dir, evicted, placeholder, evicted.length - 1, config).length + ledgerExtra;
+        const maxLagHeader = buildHeader(input, dir, evicted, placeholder, evicted.length - 1, effectiveConfig).length + ledgerExtra;
         const lagProtect = evicted[evicted.length - 1]?.seq;
         const lagIdxLen = renderIndex(episodes, indexCap, { protectAfterSeq: lagProtect }).length;
         const lagSlack = fullIdxLen > indexCap ? Math.max(0, indexCap - lagIdxLen) : 0;
@@ -7463,12 +7592,13 @@ function planCompaction(input, config, reserveFullLedger) {
   };
   let picked;
   try {
-    picked = layout(verbatim, maskedSizes, guard.from, makeHeaderSizer(preferredLedgerChars), budget, config);
+    picked = layout(verbatim, maskedSizes, guard.from, makeHeaderSizer(preferredLedgerChars), budget, effectiveConfig);
   } catch (error) {
     if (!(error instanceof OversizeError) || preferredLedgerChars === 0) throw error;
-    picked = layout(verbatim, maskedSizes, guard.from, makeHeaderSizer(0), budget, config);
+    picked = layout(verbatim, maskedSizes, guard.from, makeHeaderSizer(0), budget, effectiveConfig);
   }
   return {
+    config: effectiveConfig,
     hidden,
     ratio,
     charsPerToken,
@@ -7495,6 +7625,7 @@ async function compact(input, config, ledgerFn = updateLedger) {
   const release = await acquireLock(dir, "compact.lock");
   try {
     const plan = planCompaction(input, config);
+    const effectiveConfig = plan.config;
     const {
       state,
       rows,
@@ -7515,9 +7646,9 @@ async function compact(input, config, ledgerFn = updateLedger) {
       charsPerToken,
       mediaWrites
     } = plan;
-    const { all, pending, branch, matched } = plan.reconciled;
+    const { all, pending, branch, matched, recoveredTail } = plan.reconciled;
     const tailRow = units[tail].start;
-    const budget = budgetChars(config);
+    const budget = budgetChars(effectiveConfig);
     let ledger;
     if (adoptedLedger) {
       ledger = adoptedLedger;
@@ -7526,7 +7657,7 @@ async function compact(input, config, ledgerFn = updateLedger) {
     } else if (input.ledgerMode === "ready") {
       ledger = base;
     } else {
-      ledger = await advanceLedger(base, rows, cutRow, config, ledgerFn, input.instructions);
+      ledger = await advanceLedger(base, rows, cutRow, effectiveConfig, ledgerFn, input.instructions);
     }
     const entries = [];
     const records = [];
@@ -7551,18 +7682,24 @@ async function compact(input, config, ledgerFn = updateLedger) {
       const { start, end } = units[u];
       if (whole[u]) {
         handles[u].forEach((inputIndex, k) => {
-          body.push(() => {
-            entries.push({ keep: inputIndex });
-            records.push({
-              fp: fingerprint(input.messages[inputIndex]),
-              upto: start + k + 1,
-              seq: rows[start + k].seq,
-              role: rows[start + k].role
+          const row = rows[start + k];
+          if (isToolResultRow(row)) {
+            const built = rebuildToolResultRow(row);
+            body.push(() => emitBuilt(built, start + k + 1, "tail"));
+          } else {
+            body.push(() => {
+              entries.push({ keep: inputIndex });
+              records.push({
+                fp: fingerprint(input.messages[inputIndex]),
+                upto: start + k + 1,
+                seq: row.seq,
+                role: row.role
+              });
+              const extra = hiddenChars(hidden.get(inputIndex), ratio);
+              tailHidden += extra;
+              layers.tail += calibratedTextChars(messageChars(row), charsPerToken) + extra;
             });
-            const extra = hiddenChars(hidden.get(inputIndex), ratio);
-            tailHidden += extra;
-            layers.tail += calibratedTextChars(messageChars(rows[start + k]), charsPerToken) + extra;
-          });
+          }
         });
       } else {
         for (const m of rawBuilt[u]) body.push(() => emitBuilt(m, end, "tail"));
@@ -7571,34 +7708,25 @@ async function compact(input, config, ledgerFn = updateLedger) {
     if (cutRow > 0) {
       const evicted = rows.slice(0, cutRow);
       const bodyChars = maskedSizes.slice(cut2, tail).reduce((a, b) => a + b, 0) + verbatim.slice(tail).reduce((a, b) => a + b, 0);
-      const emptyHeader = buildHeader(input, dir, evicted, "", ledger.ledgerThrough, config).length;
-      const probeHeader = buildHeader(input, dir, evicted, "x", ledger.ledgerThrough, config).length;
+      const emptyHeader = buildHeader(input, dir, evicted, "", ledger.ledgerThrough, effectiveConfig).length;
+      const probeHeader = buildHeader(input, dir, evicted, "x", ledger.ledgerThrough, effectiveConfig).length;
       const ledgerWrapper = probeHeader - emptyHeader - 1;
-      const shown = fitLedger(ledger.ledger, budget - bodyChars - emptyHeader - ledgerWrapper);
-      emitBuilt({ role: "user", text: buildHeader(input, dir, evicted, shown, ledger.ledgerThrough, config), toolUses: [] }, cutRow, "header");
+      const ledgerCap = shareChars(effectiveConfig, "ledger");
+      const shown = fitLedger(ledger.ledger, Math.min(ledgerCap, budget - bodyChars - emptyHeader - ledgerWrapper));
+      emitBuilt({ role: "user", text: buildHeader(input, dir, evicted, shown, ledger.ledgerThrough, effectiveConfig), toolUses: [] }, cutRow, "header");
     }
     for (const emit of body) emit();
+    if (entries.length === 0) throw new DeclineError("compaction produced no messages");
     const outputChars = layers.header + layers.middle + layers.tail;
     if (outputChars > budget) throw new OversizeError(`assembled output is ${outputChars} chars, over the ${budget}-char budget`);
-    if (mediaWrites.length) mkdirSync3(join5(dir, "media"), { recursive: true });
-    for (const { path: path2, data } of mediaWrites) writeFileSync3(path2, Buffer.from(data, "base64"));
-    appendArchive(dir, pending);
-    writeState(dir, {
-      branch,
-      lastOutput: records,
-      ledger: ledger.ledger,
-      ledgerThrough: ledger.ledgerThrough,
-      ledgerAge: ledger.ledgerAge,
-      compactions: state.compactions + 1,
-      lastCut: cutRow
-    });
-    return {
+    const result = {
       entries,
       stats: {
         archived: all.length,
         newRaw: pending.length,
         matched,
         matchedPrevious: state.lastOutput.length > 0 && matched === state.lastOutput.length,
+        ...recoveredTail ? { recoveredTail: true } : {},
         previousOutput: state.lastOutput.length,
         branch: branch.length,
         cut: cutRow,
@@ -7615,30 +7743,50 @@ async function compact(input, config, ledgerFn = updateLedger) {
         ...ledger.error ? { ledgerError: ledger.error } : {}
       }
     };
+    if (input.maxOutputBytes !== void 0) {
+      const serializedBytes = Buffer.byteLength(JSON.stringify(result), "utf-8");
+      if (serializedBytes > input.maxOutputBytes) {
+        throw new OversizeError(`serialized compaction output is ${serializedBytes} bytes, over the ${input.maxOutputBytes}-byte transport limit`);
+      }
+    }
+    if (mediaWrites.length) mkdirSync3(join5(dir, "media"), { recursive: true });
+    for (const { path: path2, data } of mediaWrites) writeFileSync3(path2, Buffer.from(data, "base64"));
+    appendArchive(dir, pending);
+    writeState(dir, {
+      branch,
+      lastOutput: records,
+      ledger: ledger.ledger,
+      ledgerThrough: ledger.ledgerThrough,
+      ledgerAge: ledger.ledgerAge,
+      compactions: state.compactions + 1,
+      lastCut: cutRow
+    });
+    return result;
   } finally {
     release();
   }
 }
 function resolvePrepareTarget(input, config) {
   if ("through" in input && input.through !== void 0) {
-    const dir = sessionDir(config.dataDir, input.sessionKey);
+    const effectiveConfig = withEffectiveBudget(config, input.overheadTokens);
+    const dir = sessionDir(effectiveConfig.dataDir, input.sessionKey);
     const state = readState(dir);
     const archive = readArchive(dir);
     const bySeq = new Map(archive.map((m) => [m.seq, m]));
     const rows = state.branch.map((seq) => bySeq.get(seq)).filter((m) => m !== void 0);
     const cutRow = Math.min(Math.max(0, Math.floor(input.through)), rows.length);
     const base = bestLedger(dir, state, rows, false);
-    return { dir, rows, cutRow, base, enforceMinChars: false };
+    return { dir, rows, cutRow, base, enforceMinChars: false, config: effectiveConfig };
   }
   const plan = planCompaction(input, config, true);
-  return { dir: plan.dir, rows: plan.rows, cutRow: plan.cutRow, base: plan.base, enforceMinChars: true };
+  return { dir: plan.dir, rows: plan.rows, cutRow: plan.cutRow, base: plan.base, enforceMinChars: true, config: plan.config };
 }
 function planLedger(input, config, options = {}) {
   const target = resolvePrepareTarget(input, config);
   const enforceMinChars = options.enforceMinChars ?? target.enforceMinChars;
-  const { work, reason } = chooseLedgerWork(target.base, target.rows, target.cutRow, config, input.instructions, enforceMinChars);
+  const { work, reason } = chooseLedgerWork(target.base, target.rows, target.cutRow, target.config, input.instructions, enforceMinChars);
   if (!work) return { needed: false, reason: reason ?? "nothing new to fold in" };
-  const maxChars = shareChars(config, "ledger");
+  const maxChars = shareChars(target.config, "ledger");
   return {
     needed: true,
     previous: work.previous,
@@ -7647,7 +7795,7 @@ function planLedger(input, config, options = {}) {
     maxChars,
     maxTokens: ledgerMaxTokens(maxChars),
     system: LEDGER_SYSTEM_PROMPT,
-    model: config.ledgerModel,
+    model: target.config.ledgerModel,
     through: work.targetThrough,
     prefixHash: prefixHash(target.rows, work.targetThrough),
     age: work.nextAge
@@ -7656,12 +7804,12 @@ function planLedger(input, config, options = {}) {
 async function prepare(input, config, ledgerFn = updateLedger) {
   const target = resolvePrepareTarget(input, config);
   const { dir, rows, cutRow, base, enforceMinChars } = target;
-  const { work, reason } = chooseLedgerWork(base, rows, cutRow, config, input.instructions, enforceMinChars);
+  const { work, reason } = chooseLedgerWork(base, rows, cutRow, target.config, input.instructions, enforceMinChars);
   if (!work) return { prepared: false, reason: reason ?? "nothing new to fold in" };
   const release = tryLock(dir);
   if (!release) return { prepared: false, reason: "another prepare job is running" };
   try {
-    const next = await advanceLedger(base, rows, cutRow, config, ledgerFn, input.instructions);
+    const next = await advanceLedger(base, rows, cutRow, target.config, ledgerFn, input.instructions);
     if (next.error) return { prepared: false, reason: `ledger update failed: ${next.error}` };
     if (next.ledgerThrough === base.ledgerThrough && next.ledger === base.ledger) return { prepared: false, reason: "nothing new to fold in" };
     writeReady(dir, {
@@ -7817,11 +7965,14 @@ function searchArchive(dir, options) {
       });
     }
   }
-  const header = `strata search "${query}" (${branchScoped ? "active branch" : "full archive"}, ${totalMatches} match${totalMatches === 1 ? "" : "es"} across ${candidates.length} messages${totalMatches > matches.length ? `, showing first ${matches.length}` : ""}):`;
+  const offBranchCount = branchSet ? archive.filter((m) => !branchSet.has(m.seq)).length : 0;
+  const offBranchNote = branchScoped && offBranchCount > 0 ? `; ${offBranchCount} archived message${offBranchCount === 1 ? "" : "s"} outside active branch skipped (include with all_branches=true or --all-branches)` : "";
+  const header = `strata search "${query}" (${branchScoped ? "active branch" : "full archive"}, ${totalMatches} match${totalMatches === 1 ? "" : "es"} across ${candidates.length} messages${totalMatches > matches.length ? `, showing first ${matches.length}` : ""}${offBranchNote}):`;
   const lines = matches.length ? [header, ...matches.map((m) => `- #${m.seq} (${m.role}${m.hasError ? ", error" : ""}): ${m.snippet}`)] : [header, "(no matches)"];
   return {
     query,
     branchScoped,
+    offBranchCount,
     scanned: candidates.length,
     totalMatches,
     matches,
@@ -7984,6 +8135,7 @@ function budgetOverride(raw) {
 function readJsonInput(source) {
   return JSON.parse(readFileSync5(source === "-" ? 0 : source, "utf-8"));
 }
+var STDOUT_TRANSPORT_MAX_BYTES = 4e6;
 async function runCompact(argv) {
   const { values } = parseArgs({
     args: argv,
@@ -8013,6 +8165,7 @@ async function runCompact(argv) {
       ...payload.usage ? { usage: payload.usage } : {},
       ...payload.preparedLedger ? { preparedLedger: payload.preparedLedger } : {},
       ...payload.ledgerError ? { ledgerError: payload.ledgerError } : {},
+      ...values.out === "-" ? { maxOutputBytes: STDOUT_TRANSPORT_MAX_BYTES } : {},
       showCommand: SHOW_COMMAND(values.session)
     },
     config
@@ -8029,6 +8182,7 @@ async function runPrepare(argv) {
       session: { type: "string" },
       in: { type: "string" },
       through: { type: "string" },
+      overhead: { type: "string" },
       instructions: { type: "string" },
       budget: { type: "string" }
     }
@@ -8037,8 +8191,14 @@ async function runPrepare(argv) {
   const config = loadConfig(budgetOverride(values.budget));
   if (values.through !== void 0) {
     const through = parseIntArg("--through", values.through, 0);
+    const overheadTokens = parseIntArg("--overhead", values.overhead, 0);
     const result2 = await prepare(
-      { sessionKey: values.session, through, ...values.instructions ? { instructions: values.instructions } : {} },
+      {
+        sessionKey: values.session,
+        through,
+        ...overheadTokens !== void 0 ? { overheadTokens } : {},
+        ...values.instructions ? { instructions: values.instructions } : {}
+      },
       config
     );
     process.stdout.write(`${JSON.stringify(result2)}
@@ -8068,6 +8228,7 @@ function runLedgerPlan(argv) {
       session: { type: "string" },
       in: { type: "string" },
       through: { type: "string" },
+      overhead: { type: "string" },
       instructions: { type: "string" },
       budget: { type: "string" },
       sync: { type: "boolean" }
@@ -8078,8 +8239,14 @@ function runLedgerPlan(argv) {
   const options = values.sync ? { enforceMinChars: false } : {};
   if (values.through !== void 0) {
     const through = parseIntArg("--through", values.through, 0);
+    const overheadTokens = parseIntArg("--overhead", values.overhead, 0);
     const plan2 = planLedger(
-      { sessionKey: values.session, through, ...values.instructions ? { instructions: values.instructions } : {} },
+      {
+        sessionKey: values.session,
+        through,
+        ...overheadTokens !== void 0 ? { overheadTokens } : {},
+        ...values.instructions ? { instructions: values.instructions } : {}
+      },
       config,
       options
     );
@@ -8110,11 +8277,13 @@ function runLedgerSave(argv) {
     options: {
       session: { type: "string" },
       in: { type: "string" },
+      overhead: { type: "string" },
       budget: { type: "string" }
     }
   });
   if (!values.session || !values.in) fail("ledger-save needs --session and --in");
-  const config = loadConfig(budgetOverride(values.budget));
+  const overheadTokens = parseIntArg("--overhead", values.overhead, 0);
+  const config = withEffectiveBudget(loadConfig(budgetOverride(values.budget)), overheadTokens);
   const dir = sessionDir(config.dataDir, values.session);
   const payload = readJsonInput(values.in);
   if (typeof payload.ledger !== "string" || typeof payload.through !== "number" || typeof payload.prefixHash !== "string" || typeof payload.age !== "number") {
@@ -8221,7 +8390,7 @@ function runStatus(argv) {
 function summarize(s) {
   const k = (chars) => `${Math.round(estimateTokens(chars) / 1e3)}k`;
   return [
-    `archived ${s.archived} (+${s.newRaw}${s.matchedPrevious ? "" : `, matched ${s.matched}`}) branch ${s.branch}`,
+    `archived ${s.archived} (+${s.newRaw}${s.matchedPrevious ? "" : s.recoveredTail ? `, recovered tail ${s.matched}` : `, matched ${s.matched}`}) branch ${s.branch}`,
     `raw ${k(s.rawChars)} -> out ${k(s.outputChars)}`,
     `header ${k(s.layers.header)} middle ${k(s.layers.middle)} tail ${k(s.layers.tail)}${s.hiddenChars ? ` (${k(s.hiddenChars)} images/thinking)` : ""}`,
     s.mediaSaved ? `${s.mediaSaved} images archived` : "",

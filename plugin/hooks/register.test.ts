@@ -540,4 +540,171 @@ describe('strataCompact', () => {
     expect(result.messages?.[0]?.text).toBe('built-in summary')
     expect(logs.some(l => l.includes('compaction declined'))).toBe(true)
   })
+
+  test('logs recoveredTail cleanly when continuity is recovered after truncated resume', async () => {
+    const logs: string[] = []
+    const stdout = JSON.stringify({
+      entries: [{ built: HEADER }, { keep: 2 }],
+      stats: { rawChars: 14_000, outputChars: 3_500, matched: 4, recoveredTail: true, previousOutput: 20, cut: 10, ledgerThrough: 10 }
+    })
+    await strataCompact(fakeEngine(cli(stdout), [], logs, []), { trigger: 'plugin', messages: MESSAGES }, builtIn, SESSION)
+    expect(logs.some(l => l.includes('recovered branch from 4 tail rows after truncated resume'))).toBe(true)
+    expect(logs.some(l => l.includes('only 4/20'))).toBe(false)
+  })
+
+  test('surfaces background prepare failures visibly (deduplicated) and reports last prep status in /strata', async ($, on) => {
+    const clock = mock.clock(on)
+    mock.env(on, { STRATA_TRIGGER_TOKENS: '1000' })
+    const visibleLogs: string[] = []
+    const debugLogs: string[] = []
+    let failPlan = true
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
+    on('tool.register', (_$, e) => ({ value: { tool: `mcp__strata__${e.name}` } }))
+    on('command.register', (_$, e) => ({ value: { command: e.name } }))
+    on('session.usage', () => ({ value: { startedAt: 0, context: { ...BREAKDOWN, tokens: 800, percent: 1 } as never, rateLimits: [] } }))
+    on('session.id', () => ({ value: SESSION }))
+    on('session.messages', (_$, e) => ({ value: e?.as === 'api' ? API_FORM : MESSAGES }))
+    on('model.complete', () => ({ value: { isAnswered: true as const, text: '## Current state\n- recovered (#0)', usage: ZERO_USAGE } }))
+    on('process.run', (_$, e) => {
+      if (e.argv.includes('ledger-plan')) return { value: failPlan ? cli('', 1, 'plan crashed') : cli(JSON.stringify(SAMPLE_PLAN)) }
+      if (e.argv.includes('ledger-save')) return { value: cli(JSON.stringify({ saved: true, through: 2 })) }
+      if (e.argv.includes('status')) {
+        return {
+          value: cli(
+            JSON.stringify({
+              sessionKey: SESSION,
+              archiveCount: 10,
+              archiveBytes: 2048,
+              mediaCount: 0,
+              branchLength: 10,
+              compactions: 1,
+              lastCut: 4,
+              ledgerThrough: 0,
+              ledgerChars: 0,
+              ledgerAge: 0,
+              ledgerLag: 4
+            })
+          )
+        }
+      }
+      return { value: cli('{}') }
+    })
+    on('ui.log', (_$, e) => {
+      if (e.to === 'debug') debugLogs.push(e.text)
+      else visibleLogs.push(e.text)
+      return { value: undefined }
+    })
+    on('turn.complete', () => ({ text: 'done' }))
+
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+    // First failure surfaces visibly.
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+    await clock.advance(0)
+    expect(visibleLogs.filter(l => l.includes('background ledger prep failed'))).toHaveLength(1)
+
+    // Identical repeated failure is deduplicated to debug so it does not spam the UI.
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' })
+    await clock.advance(0)
+    expect(visibleLogs.filter(l => l.includes('background ledger prep failed'))).toHaveLength(1)
+    expect(debugLogs.some(l => l.includes('plan crashed'))).toBe(true)
+
+    const statusFail = await $.command.run({ command: 'strata', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+    expect(statusFail.text).toContain('background prep: idle (failed: plan failed (exit 1): plan crashed)')
+
+    // Once background prep succeeds, /strata reflects the recovered status.
+    failPlan = false
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't3', reason: 'answer' })
+    await clock.advance(0)
+    const statusOk = await $.command.run({ command: 'strata', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+    expect(statusOk.text).toContain('background prep: idle (saved through 2)')
+  })
+
+  test('handles ledger-save saved:false, exit-3 decline as debug skip, and ignores stale-generation prep updates after session.end', async ($, on) => {
+    const clock = mock.clock(on)
+    mock.env(on, { STRATA_TRIGGER_TOKENS: '1000' })
+    const visibleLogs: string[] = []
+    const debugLogs: string[] = []
+    let mode: 'declined' | 'save-skipped' | 'stale-race' = 'declined'
+    let resolveSlowPlan: ((v: ProcessRunResult) => void) | undefined
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
+    on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
+    on('tool.register', (_$, e) => ({ value: { tool: `mcp__strata__${e.name}` } }))
+    on('command.register', (_$, e) => ({ value: { command: e.name } }))
+    on('session.usage', () => ({ value: { startedAt: 0, context: { ...BREAKDOWN, tokens: 800, percent: 1 } as never, rateLimits: [] } }))
+    on('session.id', () => ({ value: SESSION }))
+    on('session.messages', (_$, e) => ({ value: e?.as === 'api' ? API_FORM : MESSAGES }))
+    on('model.complete', () => ({ value: { isAnswered: true as const, text: '## Current state\n- ok (#0)', usage: ZERO_USAGE } }))
+    on('process.run', async (_$, e) => {
+      if (e.argv.includes('ledger-plan')) {
+        if (mode === 'declined') return { value: cli('', 3, 'oversize\n  at planCompaction') }
+        if (mode === 'stale-race') {
+          const val = await new Promise<ProcessRunResult>(resolve => {
+            resolveSlowPlan = resolve
+          })
+          return { value: val }
+        }
+        return { value: cli(JSON.stringify(SAMPLE_PLAN)) }
+      }
+      if (e.argv.includes('ledger-save')) {
+        return { value: cli(JSON.stringify({ saved: false, reason: 'existing ready ledger covers further on this branch', through: 10 })) }
+      }
+      if (e.argv.includes('status')) {
+        return {
+          value: cli(
+            JSON.stringify({
+              sessionKey: SESSION,
+              archiveCount: 10,
+              archiveBytes: 2048,
+              mediaCount: 0,
+              branchLength: 10,
+              compactions: 1,
+              lastCut: 4,
+              ledgerThrough: 0,
+              ledgerChars: 0,
+              ledgerAge: 0,
+              ledgerLag: 4
+            })
+          )
+        }
+      }
+      return { value: cli('{}') }
+    })
+    on('ui.log', (_$, e) => {
+      if (e.to === 'debug') debugLogs.push(e.text)
+      else visibleLogs.push(e.text)
+      return { value: undefined }
+    })
+    on('turn.complete', () => ({ text: 'done' }))
+
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+
+    // 1. Exit 3 (declined) is recorded as skipped in debug, not a visible failure.
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+    await clock.advance(0)
+    expect(visibleLogs).toHaveLength(0)
+    expect(debugLogs.some(l => l.includes('declined (oversize)'))).toBe(true)
+    const statusDeclined = await $.command.run({ command: 'strata', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+    expect(statusDeclined.text).toContain('skipped: declined (oversize)')
+
+    // 2. ledger-save returning { saved: false } reports skipped, not "saved through".
+    mode = 'save-skipped'
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' })
+    await clock.advance(0)
+    const statusSkipped = await $.command.run({ command: 'strata', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+    expect(statusSkipped.text).toContain('skipped: existing ready ledger covers further on this branch')
+    expect(statusSkipped.text).not.toContain('saved through')
+
+    // 3. Stale job finishing after session.end must not clobber the new session's status or log visibly.
+    mode = 'stale-race'
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't3', reason: 'answer' })
+    clock.advance(0)
+    for (let i = 0; i < 4; i++) await Promise.resolve()
+    await $.session.end({ reason: 'clear', sessionId: SESSION, resume: { id: SESSION } })
+    resolveSlowPlan?.(cli('', 1, 'old session crashed'))
+    for (let i = 0; i < 6; i++) await Promise.resolve()
+    expect(visibleLogs).toHaveLength(0)
+    const statusFresh = await $.command.run({ command: 'strata', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+    expect(statusFresh.text).toContain('background prep: idle')
+    expect(statusFresh.text).not.toContain('old session crashed')
+  })
 })

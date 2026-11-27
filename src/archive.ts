@@ -217,3 +217,66 @@ export function matchedPrefix(input: Message[], state: SessionState): number {
   }
   return p
 }
+
+const MIN_TAIL_RECOVERY_RECORDS = 2
+
+function hasToolIdentity(m: Message): boolean {
+  return m.toolUses.length > 0 || (m.toolResults?.length ?? 0) > 0
+}
+
+export type ResumedTailMatch = {
+  /** Index in `input` where the matched tail begins (always 0). */
+  inputStart: number
+  /** Index in `state.lastOutput` where the matched suffix begins. */
+  outputStart: number
+  /** Number of consecutive tail records matched to the end of `state.lastOutput`. */
+  count: number
+}
+
+/**
+ * Recover continuity for legacy pre-v0.3.4 sessions whose `--resume` truncated
+ * the front of the conversation (dropping the strata header and middle because
+ * of Claude Code's `sourceToolAssistantUUID` parentUuid jump) and handed over
+ * only the trailing kept rows of `state.lastOutput`. Requires a full contiguous
+ * suffix match through the end of `state.lastOutput` of at least 2 records with
+ * at least one kept (`seq >= 0`) record AND a unique `tool_use_id` anchor so
+ * genuine rewinds or replacement conversations with repeated prompt text never
+ * false-match.
+ */
+export function matchedResumedTail(input: Message[], state: SessionState): ResumedTailMatch | undefined {
+  const out = state.lastOutput
+  if (out.length < MIN_TAIL_RECOVERY_RECORDS || input.length < MIN_TAIL_RECOVERY_RECORDS) return undefined
+
+  const inputFps = new Map<number, string>()
+  const fpOf = (i: number): string => {
+    let fp = inputFps.get(i)
+    if (fp === undefined) {
+      fp = fingerprint(input[i])
+      inputFps.set(i, fp)
+    }
+    return fp
+  }
+
+  // Prefer the longest suffix match (smallest outputStart > 0) that reaches out.length.
+  const minOutStart = Math.max(1, out.length - input.length)
+  for (let outputStart = minOutStart; outputStart <= out.length - MIN_TAIL_RECOVERY_RECORDS; outputStart++) {
+    const count = out.length - outputStart
+    let ok = true
+    let keptCount = 0
+    let hasToolId = false
+    for (let k = 0; k < count; k++) {
+      const msg = input[k]
+      const rec = out[outputStart + k]
+      if (fpOf(k) !== rec.fp) {
+        ok = false
+        break
+      }
+      if (rec.seq >= 0) keptCount++
+      if (hasToolIdentity(msg)) hasToolId = true
+    }
+    if (ok && keptCount >= 1 && hasToolId) {
+      return { inputStart: 0, outputStart, count }
+    }
+  }
+  return undefined
+}

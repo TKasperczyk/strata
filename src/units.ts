@@ -19,7 +19,7 @@ function mediaNote(paths: string[]): string {
 }
 
 /** A rebuilt row loses its images: point at the files the archive saved instead. */
-function withMedia(row: ArchivedMessage, viewed: Message): Message {
+export function withMedia(row: ArchivedMessage, viewed: Message): Message {
   if (!row.media?.length) return viewed
   const loose = row.media.filter(m => m.toolUseId === undefined).map(m => m.path)
   const text = loose.length ? [viewed.text, mediaNote(loose)].filter(Boolean).join('\n') : viewed.text
@@ -32,6 +32,26 @@ function withMedia(row: ArchivedMessage, viewed: Message): Message {
 
 export function isPrompt(m: Message): boolean {
   return m.role === 'user' && !(m.toolResults?.length)
+}
+
+export function isToolResultRow(m: Message): boolean {
+  return m.role === 'user' && Boolean(m.toolResults?.length)
+}
+
+/**
+ * Rebuild a user tool_result row as a plain hook-built message (unmasked, with
+ * saved media pointers). Claude Code's session.compact cloner keeps
+ * `sourceToolAssistantUUID` pointing before `compact_boundary` on kept
+ * tool_result handles, which breaks `parentUuid` chaining on `--resume`.
+ */
+export function rebuildToolResultRow(row: ArchivedMessage): Message {
+  const m = withMedia(row, row)
+  return {
+    role: 'user',
+    text: m.text,
+    toolUses: [],
+    toolResults: m.toolResults ?? []
+  }
 }
 
 /**
@@ -98,7 +118,9 @@ export function rebuildUnit(rows: ArchivedMessage[], mode: RebuildMode, config: 
   }
   const answered = new Set(results.map(r => r.tool_use_id))
   const called = new Set(uses.map(u => u.tool_use_id))
-  const pairedUses = uses.filter(u => answered.has(u.tool_use_id))
+  const pairedUses: ToolUse[] = uses
+    .filter(u => answered.has(u.tool_use_id))
+    .map(u => ({ tool_use_id: u.tool_use_id, tool: u.tool, input: u.input }))
   const pairedResults = results.filter(r => called.has(r.tool_use_id))
   const out: Message[] = []
   if (texts.length || pairedUses.length) out.push({ role: 'assistant', text: texts.join('\n'), toolUses: pairedUses })

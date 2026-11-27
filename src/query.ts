@@ -129,6 +129,7 @@ export type SearchMatch = {
 export type SearchResult = {
   query: string
   branchScoped: boolean
+  offBranchCount: number
   scanned: number
   totalMatches: number
   matches: SearchMatch[]
@@ -199,13 +200,19 @@ export function searchArchive(dir: string, options: SearchOptions): SearchResult
     }
   }
 
-  const header = `strata search "${query}" (${branchScoped ? 'active branch' : 'full archive'}, ${totalMatches} match${totalMatches === 1 ? '' : 'es'} across ${candidates.length} messages${totalMatches > matches.length ? `, showing first ${matches.length}` : ''}):`
+  const offBranchCount = branchSet ? archive.filter(m => !branchSet.has(m.seq)).length : 0
+  const offBranchNote =
+    branchScoped && offBranchCount > 0
+      ? `; ${offBranchCount} archived message${offBranchCount === 1 ? '' : 's'} outside active branch skipped (include with all_branches=true or --all-branches)`
+      : ''
+  const header = `strata search "${query}" (${branchScoped ? 'active branch' : 'full archive'}, ${totalMatches} match${totalMatches === 1 ? '' : 'es'} across ${candidates.length} messages${totalMatches > matches.length ? `, showing first ${matches.length}` : ''}${offBranchNote}):`
   const lines = matches.length
     ? [header, ...matches.map(m => `- #${m.seq} (${m.role}${m.hasError ? ', error' : ''}): ${m.snippet}`)]
     : [header, '(no matches)']
   return {
     query,
     branchScoped,
+    offBranchCount,
     scanned: candidates.length,
     totalMatches,
     matches,
